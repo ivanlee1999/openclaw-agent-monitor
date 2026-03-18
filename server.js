@@ -2,6 +2,7 @@ const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const { execSync } = require("child_process");
 
 const app = express();
 const PORT = 3847;
@@ -332,6 +333,265 @@ app.get("/api/sessions/:id/latest", (req, res) => {
   } catch (err) {
     console.error("Error reading latest activity:", err.message);
     res.json([]);
+  }
+});
+
+// --- PR Extraction from JSONL files ---
+const prJsonlCache = new Map(); // key: jsonlPath -> { mtimeMs, prs: [{url, sessionId, sessionName}] }
+const prGhCache = new Map(); // key: prUrl -> { fetchedAt, data }
+const PR_GH_CACHE_TTL = 60000; // 60 seconds
+const PR_URL_RE = /https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/g;
+
+function getAllJsonlPaths() {
+  const claudeProjectsDir = path.join(os.homedir(), ".claude", "projects");
+  if (!fs.existsSync(claudeProjectsDir)) return [];
+  const results = [];
+  try {
+    const projectDirs = fs.readdirSync(claudeProjectsDir, { withFileTypes: true });
+    for (const dir of projectDirs) {
+      if (!dir.isDirectory()) continue;
+      const dirPath = path.join(claudeProjectsDir, dir.name);
+      const files = fs.readdirSync(dirPath).filter(f => f.endsWith(".jsonl"));
+      for (const f of files) {
+        results.push(path.join(dirPath, f));
+      }
+    }
+  } catch {}
+  return results;
+}
+
+function extractPRsFromJsonl(jsonlPath) {
+  try {
+    const stat = fs.statSync(jsonlPath);
+    const cached = prJsonlCache.get(jsonlPath);
+    if (cached && cached.mtimeMs === stat.mtimeMs) return cached.prs;
+
+    const raw = fs.readFileSync(jsonlPath, "utf-8");
+    const lines = raw.split("\n").filter(l => l.trim());
+    const prs = [];
+    const seenUrls = new Set();
+    const harnessSessionId = path.basename(jsonlPath, ".jsonl");
+
+    // Find session info
+    let sessionName = "";
+    let sessionId = "";
+    if (fs.existsSync(SESSIONS_FILE)) {
+      try {
+        const sessionsData = JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf-8"));
+        const session = sessionsData.find(s => s.harnessSessionId === harnessSessionId);
+        if (session) {
+          sessionName = session.name || "";
+          sessionId = session.sessionId || "";
+        }
+      } catch {}
+    }
+
+    // Strategy 1: Look for gh pr create tool_use and corresponding tool_result
+    const entries = [];
+    for (const line of lines) {
+      try { entries.push(JSON.parse(line)); } catch {}
+    }
+
+    const ghPrCreateToolIds = new Set();
+    for (const entry of entries) {
+      if (entry.type === "assistant" && Array.isArray(entry.message?.content)) {
+        for (const block of entry.message.content) {
+          if (block.type === "tool_use" && block.name === "Bash" &&
+              typeof block.input?.command === "string" && block.input.command.includes("gh pr create")) {
+            if (block.id) ghPrCreateToolIds.add(block.id);
+          }
+        }
+      }
+    }
+
+    // Find tool_results matching those tool_use ids
+    for (const entry of entries) {
+      if (entry.type === "user" && Array.isArray(entry.message?.content)) {
+        for (const block of entry.message.content) {
+          if (block.type === "tool_result" && ghPrCreateToolIds.has(block.tool_use_id)) {
+            const text = typeof block.content === "string" ? block.content :
+              Array.isArray(block.content) ? block.content.map(c => typeof c === "string" ? c : c.text || "").join("\n") : "";
+            let match;
+            const re = new RegExp(PR_URL_RE.source, "g");
+            while ((match = re.exec(text)) !== null) {
+              if (!seenUrls.has(match[0])) {
+                seenUrls.add(match[0]);
+                prs.push({ url: match[0], owner: match[1], repo: match[2], number: parseInt(match[3]), sessionId, sessionName, harnessSessionId });
+              }
+            }
+          }
+        }
+      }
+      // Also check top-level tool_result entries
+      if (entry.type === "tool_result" && ghPrCreateToolIds.has(entry.tool_use_id)) {
+        const text = typeof entry.content === "string" ? entry.content :
+          Array.isArray(entry.content) ? entry.content.map(c => typeof c === "string" ? c : c.text || "").join("\n") : "";
+        let match;
+        const re = new RegExp(PR_URL_RE.source, "g");
+        while ((match = re.exec(text)) !== null) {
+          if (!seenUrls.has(match[0])) {
+            seenUrls.add(match[0]);
+            prs.push({ url: match[0], owner: match[1], repo: match[2], number: parseInt(match[3]), sessionId, sessionName, harnessSessionId });
+          }
+        }
+      }
+    }
+
+    // Strategy 2: Fallback - scan assistant text blocks for PR URLs
+    for (const entry of entries) {
+      if (entry.type === "assistant" && Array.isArray(entry.message?.content)) {
+        for (const block of entry.message.content) {
+          if (block.type === "text" && typeof block.text === "string") {
+            let match;
+            const re = new RegExp(PR_URL_RE.source, "g");
+            while ((match = re.exec(block.text)) !== null) {
+              if (!seenUrls.has(match[0])) {
+                seenUrls.add(match[0]);
+                prs.push({ url: match[0], owner: match[1], repo: match[2], number: parseInt(match[3]), sessionId, sessionName, harnessSessionId });
+              }
+            }
+          }
+        }
+      }
+    }
+
+    prJsonlCache.set(jsonlPath, { mtimeMs: stat.mtimeMs, prs });
+    return prs;
+  } catch {
+    return [];
+  }
+}
+
+function getAllPRsFromJsonls() {
+  const allPaths = getAllJsonlPaths();
+  const allPrs = [];
+  const seenUrls = new Set();
+  for (const p of allPaths) {
+    const prs = extractPRsFromJsonl(p);
+    for (const pr of prs) {
+      if (!seenUrls.has(pr.url)) {
+        seenUrls.add(pr.url);
+        allPrs.push(pr);
+      }
+    }
+  }
+  return allPrs;
+}
+
+function fetchPRDetailsViaGh(prUrl) {
+  const cached = prGhCache.get(prUrl);
+  if (cached && (Date.now() - cached.fetchedAt) < PR_GH_CACHE_TTL) return cached.data;
+
+  try {
+    const json = execSync(
+      `gh pr view "${prUrl}" --json title,state,isDraft,createdAt,updatedAt,author,statusCheckRollup,labels,mergeable,reviews,comments,number`,
+      { encoding: "utf-8", timeout: 15000, stdio: ["pipe", "pipe", "pipe"] }
+    );
+    const data = JSON.parse(json);
+    prGhCache.set(prUrl, { fetchedAt: Date.now(), data });
+    return data;
+  } catch (err) {
+    console.error("gh pr view failed for", prUrl, err.message);
+    return null;
+  }
+}
+
+function formatPRResponse(pr, ghData) {
+  if (!ghData) {
+    return {
+      url: pr.url, owner: pr.owner, repo: pr.repo, number: pr.number,
+      title: "(unable to fetch)", state: "unknown", merged: false, draft: false,
+      createdAt: null, updatedAt: null, author: "", reviewComments: 0, reviews: 0,
+      checks: "unknown", sessionName: pr.sessionName, sessionId: pr.sessionId,
+      labels: [], mergeable: false
+    };
+  }
+
+  // Determine checks status from statusCheckRollup
+  let checks = "unknown";
+  if (Array.isArray(ghData.statusCheckRollup) && ghData.statusCheckRollup.length > 0) {
+    const allPass = ghData.statusCheckRollup.every(c => c.conclusion === "SUCCESS" || c.status === "COMPLETED" && c.conclusion === "SUCCESS");
+    const anyFail = ghData.statusCheckRollup.some(c => c.conclusion === "FAILURE" || c.conclusion === "ERROR");
+    const anyPending = ghData.statusCheckRollup.some(c => !c.conclusion || c.conclusion === "" || c.status === "IN_PROGRESS" || c.status === "QUEUED" || c.status === "PENDING");
+    if (anyFail) checks = "failing";
+    else if (anyPending) checks = "pending";
+    else if (allPass) checks = "passing";
+  }
+
+  const state = ghData.state === "MERGED" ? "merged" : ghData.state === "CLOSED" ? "closed" : "open";
+  const merged = ghData.state === "MERGED";
+
+  return {
+    url: pr.url, owner: pr.owner, repo: pr.repo, number: ghData.number || pr.number,
+    title: ghData.title || "", state, merged, draft: ghData.isDraft || false,
+    createdAt: ghData.createdAt || null, updatedAt: ghData.updatedAt || null,
+    author: ghData.author?.login || "", reviewComments: (ghData.comments || []).length,
+    reviews: (ghData.reviews || []).length, checks,
+    sessionName: pr.sessionName, sessionId: pr.sessionId,
+    labels: (ghData.labels || []).map(l => typeof l === "string" ? l : l.name || ""),
+    mergeable: ghData.mergeable === "MERGEABLE"
+  };
+}
+
+// --- PR API ---
+
+app.get("/api/prs", async (req, res) => {
+  try {
+    const prs = getAllPRsFromJsonls();
+    const results = [];
+    // Fetch gh details for each PR (sequentially to avoid hammering)
+    for (const pr of prs) {
+      const ghData = fetchPRDetailsViaGh(pr.url);
+      results.push(formatPRResponse(pr, ghData));
+    }
+    // Sort by createdAt descending
+    results.sort((a, b) => {
+      if (!a.createdAt && !b.createdAt) return 0;
+      if (!a.createdAt) return 1;
+      if (!b.createdAt) return -1;
+      return new Date(b.createdAt) - new Date(a.createdAt);
+    });
+    res.json(results);
+  } catch (err) {
+    console.error("Error fetching PRs:", err.message);
+    res.status(500).json({ error: "Failed to fetch PRs" });
+  }
+});
+
+app.get("/api/prs/:owner/:repo/:number", (req, res) => {
+  try {
+    const { owner, repo, number } = req.params;
+    const url = `https://github.com/${owner}/${repo}/pull/${number}`;
+
+    // Try to find session info from our cache
+    const allPrs = getAllPRsFromJsonls();
+    const pr = allPrs.find(p => p.url === url) || { url, owner, repo, number: parseInt(number), sessionId: "", sessionName: "", harnessSessionId: "" };
+
+    // Fetch detailed info including review comments
+    let ghData = null;
+    try {
+      const json = execSync(
+        `gh pr view "${url}" --json title,state,isDraft,createdAt,updatedAt,author,statusCheckRollup,labels,mergeable,reviews,comments,number,body`,
+        { encoding: "utf-8", timeout: 15000, stdio: ["pipe", "pipe", "pipe"] }
+      );
+      ghData = JSON.parse(json);
+    } catch (err) {
+      console.error("gh pr view failed for", url, err.message);
+    }
+
+    const result = formatPRResponse(pr, ghData);
+    if (ghData?.body) result.body = ghData.body;
+    if (ghData?.comments) result.recentComments = ghData.comments.slice(-10).map(c => ({
+      author: c.author?.login || "", body: c.body || "", createdAt: c.createdAt || ""
+    }));
+    if (ghData?.reviews) result.reviewDetails = ghData.reviews.map(r => ({
+      author: r.author?.login || "", state: r.state || "", body: r.body || "", submittedAt: r.submittedAt || ""
+    }));
+
+    res.json(result);
+  } catch (err) {
+    console.error("Error fetching PR details:", err.message);
+    res.status(500).json({ error: "Failed to fetch PR details" });
   }
 });
 
@@ -854,6 +1114,119 @@ a:hover { text-decoration: underline; }
   .cards-grid { gap: 16px; }
   .card-preview { padding: 0 14px 10px 14px; }
 }
+
+/* Main view tabs */
+.main-tabs {
+  display: flex; gap: 0; margin-bottom: 0;
+  border-bottom: 2px solid var(--border);
+}
+.main-tab {
+  background: transparent; border: none; border-bottom: 2px solid transparent;
+  color: var(--text-secondary); padding: 10px 20px; cursor: pointer; font-size: 14px;
+  font-weight: 600; font-family: 'Inter', system-ui, sans-serif;
+  transition: all 0.15s; margin-bottom: -2px;
+}
+.main-tab:hover { color: var(--text-heading); }
+.main-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+.main-tab .tab-count {
+  font-size: 11px; font-weight: 500; color: var(--text-muted);
+  margin-left: 6px; background: var(--surface); padding: 1px 6px; border-radius: 8px;
+}
+
+/* PR view */
+.pr-view { display: none; }
+.pr-view.active { display: block; }
+.sessions-view { display: block; }
+.sessions-view.hidden { display: none; }
+
+/* PR summary bar */
+.pr-summary {
+  display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+  margin-bottom: 16px; font-size: 13px; color: var(--text-secondary);
+}
+.pr-summary .pr-stat {
+  display: inline-flex; align-items: center; gap: 5px;
+}
+.pr-summary .pr-stat-value {
+  font-weight: 700; color: var(--text-heading);
+}
+.pr-summary .pr-stat-value.open-val { color: var(--completed); }
+.pr-summary .pr-stat-value.merged-val { color: var(--accent); }
+.pr-summary .pr-stat-value.draft-val { color: var(--text-muted); }
+
+/* PR filter bar */
+.pr-filter-bar {
+  display: flex; gap: 0; margin-bottom: 20px; flex-wrap: wrap; align-items: center;
+  border-bottom: 1px solid var(--border); padding-bottom: 0;
+}
+
+/* PR card */
+.pr-card {
+  background: var(--card-bg); border: 1px solid var(--border); border-radius: 2px;
+  border-left: 4px solid var(--completed); padding: 18px 22px;
+  transition: background 0.1s; margin-bottom: 12px;
+}
+.pr-card:hover { background: var(--card-hover); }
+.pr-card.state-open { border-left-color: var(--completed); }
+.pr-card.state-draft { border-left-color: var(--text-muted); }
+.pr-card.state-merged { border-left-color: var(--accent); }
+.pr-card.state-closed { border-left-color: var(--failed); }
+
+.pr-header-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px;
+}
+.pr-title {
+  font-size: 15px; font-weight: 600; color: var(--text-heading);
+  text-decoration: none; cursor: pointer;
+}
+.pr-title:hover { text-decoration: underline; color: var(--link); }
+.pr-number {
+  font-size: 13px; color: var(--text-muted); font-family: var(--mono); font-weight: 500;
+}
+.pr-state-badge {
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px;
+  padding: 2px 8px; border-radius: 2px;
+}
+.pr-state-badge.open { color: var(--completed); background: rgba(166,227,161,0.12); }
+.pr-state-badge.draft { color: var(--text-muted); background: rgba(127,132,156,0.12); }
+.pr-state-badge.merged { color: var(--accent); background: rgba(203,166,247,0.12); }
+.pr-state-badge.closed { color: var(--failed); background: rgba(243,139,168,0.12); }
+
+.pr-meta-row {
+  display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-secondary); margin-bottom: 6px;
+}
+.pr-meta-row span { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+
+.pr-stats-row {
+  display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; align-items: center;
+}
+.pr-stats-row span { display: inline-flex; align-items: center; gap: 4px; }
+
+.pr-labels {
+  display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px;
+}
+.pr-label-pill {
+  font-size: 10px; padding: 2px 8px; border-radius: 10px;
+  background: var(--surface); color: var(--text-primary); border: 1px solid var(--border);
+  font-weight: 500;
+}
+
+.pr-session-link {
+  font-size: 11px; color: var(--text-muted); margin-top: 6px; display: block;
+}
+.pr-session-link a {
+  color: var(--link); cursor: pointer; font-size: 11px;
+}
+
+.pr-loading {
+  text-align: center; padding: 40px; color: var(--text-muted); font-size: 14px;
+}
+
+.checks-pass { color: var(--completed); }
+.checks-fail { color: var(--failed); }
+.checks-pending { color: var(--killed); }
+.mergeable-yes { color: var(--completed); }
+.mergeable-no { color: var(--failed); }
 </style>
 </head>
 <body>
@@ -879,18 +1252,37 @@ a:hover { text-decoration: underline; }
 </div>
 
 <div class="container">
-  <div class="filter-bar">
-    <button class="filter-btn active" data-filter="all">All</button>
-    <button class="filter-btn" data-filter="running">Running</button>
-    <button class="filter-btn" data-filter="completed">Completed</button>
-    <button class="filter-btn" data-filter="failed">Failed</button>
-    <button class="filter-btn" data-filter="killed">Killed</button>
-    <div class="search-wrap">
-      <span class="search-icon">&#x1f50d;</span>
-      <input type="text" class="search-input" id="search-input" placeholder="Search sessions..." />
-    </div>
+  <div class="main-tabs">
+    <button class="main-tab active" id="tab-sessions" onclick="switchMainTab('sessions')">&#x1f4cb; Sessions <span class="tab-count" id="sessions-tab-count">0</span></button>
+    <button class="main-tab" id="tab-prs" onclick="switchMainTab('prs')">&#x1f517; Pull Requests <span class="tab-count" id="prs-tab-count">0</span></button>
   </div>
-  <div id="sessions-list" class="cards-grid"></div>
+
+  <div class="sessions-view" id="sessions-view">
+    <div class="filter-bar">
+      <button class="filter-btn active" data-filter="all">All</button>
+      <button class="filter-btn" data-filter="running">Running</button>
+      <button class="filter-btn" data-filter="completed">Completed</button>
+      <button class="filter-btn" data-filter="failed">Failed</button>
+      <button class="filter-btn" data-filter="killed">Killed</button>
+      <div class="search-wrap">
+        <span class="search-icon">&#x1f50d;</span>
+        <input type="text" class="search-input" id="search-input" placeholder="Search sessions..." />
+      </div>
+    </div>
+    <div id="sessions-list" class="cards-grid"></div>
+  </div>
+
+  <div class="pr-view" id="prs-view">
+    <div class="pr-summary" id="pr-summary"></div>
+    <div class="pr-filter-bar" id="pr-filter-bar">
+      <button class="filter-btn active" data-pr-filter="all">All</button>
+      <button class="filter-btn" data-pr-filter="open">Open</button>
+      <button class="filter-btn" data-pr-filter="merged">Merged</button>
+      <button class="filter-btn" data-pr-filter="closed">Closed</button>
+      <button class="filter-btn" data-pr-filter="draft">Draft</button>
+    </div>
+    <div id="prs-list"></div>
+  </div>
 </div>
 
 <script>
@@ -1414,6 +1806,7 @@ function updateStats() {
   document.getElementById("running-count").textContent = sessions.filter(s => s.status === "running").length;
   const totalCost = sessions.reduce((sum, s) => sum + (s.costUsd || 0), 0);
   document.getElementById("total-cost").textContent = formatCost(totalCost);
+  document.getElementById("sessions-tab-count").textContent = sessions.length;
 }
 
 // --- Filter ---
@@ -1482,6 +1875,155 @@ setInterval(() => {
     }
   }
 }, 5000);
+
+// --- PR Tab ---
+let prs = [];
+let prFilter = "all";
+let mainTab = "sessions";
+let prFetchInProgress = false;
+
+function switchMainTab(tab) {
+  mainTab = tab;
+  window.location.hash = tab === "sessions" ? "sessions" : "prs";
+  document.getElementById("tab-sessions").classList.toggle("active", tab === "sessions");
+  document.getElementById("tab-prs").classList.toggle("active", tab === "prs");
+  document.getElementById("sessions-view").classList.toggle("hidden", tab !== "sessions");
+  document.getElementById("prs-view").classList.toggle("active", tab === "prs");
+  if (tab === "prs" && prs.length === 0 && !prFetchInProgress) {
+    fetchPRs();
+  }
+}
+
+// Hash routing
+function initFromHash() {
+  const hash = window.location.hash.replace("#", "") || "sessions";
+  if (hash === "prs") switchMainTab("prs");
+  else switchMainTab("sessions");
+}
+
+window.addEventListener("hashchange", initFromHash);
+
+// PR filter click handler
+document.getElementById("pr-filter-bar").addEventListener("click", (e) => {
+  if (!e.target.matches("[data-pr-filter]")) return;
+  document.querySelectorAll("[data-pr-filter]").forEach(b => b.classList.remove("active"));
+  e.target.classList.add("active");
+  prFilter = e.target.dataset.prFilter;
+  renderPRs();
+});
+
+async function fetchPRs() {
+  if (prFetchInProgress) return;
+  prFetchInProgress = true;
+  const list = document.getElementById("prs-list");
+  if (prs.length === 0) list.innerHTML = '<div class="pr-loading">&#x23f3; Loading pull requests...</div>';
+  try {
+    const res = await fetch("/api/prs");
+    if (!res.ok) throw new Error("fetch failed");
+    prs = await res.json();
+    renderPRSummary();
+    renderPRs();
+    document.getElementById("prs-tab-count").textContent = prs.length;
+  } catch (err) {
+    console.error("Failed to fetch PRs:", err);
+    list.innerHTML = '<div class="pr-loading">Failed to load pull requests</div>';
+  } finally {
+    prFetchInProgress = false;
+  }
+}
+
+function renderPRSummary() {
+  const total = prs.length;
+  const open = prs.filter(p => p.state === "open" && !p.draft).length;
+  const merged = prs.filter(p => p.merged).length;
+  const draft = prs.filter(p => p.draft).length;
+  const closed = prs.filter(p => p.state === "closed" && !p.merged).length;
+  document.getElementById("pr-summary").innerHTML =
+    '<span class="pr-stat"><span class="pr-stat-value">' + total + '</span> Total</span>'
+    + '<span class="pr-stat"><span class="pr-stat-value open-val">' + open + '</span> Open</span>'
+    + '<span class="pr-stat"><span class="pr-stat-value merged-val">' + merged + '</span> Merged</span>'
+    + '<span class="pr-stat"><span class="pr-stat-value draft-val">' + draft + '</span> Draft</span>'
+    + (closed > 0 ? '<span class="pr-stat"><span class="pr-stat-value">' + closed + '</span> Closed</span>' : '');
+}
+
+function renderPRs() {
+  const list = document.getElementById("prs-list");
+  let filtered = prs;
+  if (prFilter === "open") filtered = prs.filter(p => p.state === "open" && !p.draft);
+  else if (prFilter === "merged") filtered = prs.filter(p => p.merged);
+  else if (prFilter === "closed") filtered = prs.filter(p => p.state === "closed" && !p.merged);
+  else if (prFilter === "draft") filtered = prs.filter(p => p.draft);
+
+  if (filtered.length === 0) {
+    list.innerHTML = '<div class="empty-state"><div class="icon">&#x1f517;</div>'
+      + '<h2>No pull requests found</h2><p>' + (prs.length === 0 ? 'No PRs created by agent sessions yet' : 'No PRs match this filter') + '</p></div>';
+    return;
+  }
+
+  list.innerHTML = filtered.map(pr => {
+    const stateClass = pr.draft ? "draft" : pr.merged ? "merged" : pr.state;
+    const stateBadge = pr.draft ? "draft" : pr.merged ? "merged" : pr.state;
+    const checksIcon = pr.checks === "passing" ? '<span class="checks-pass">\\u2705</span>'
+      : pr.checks === "failing" ? '<span class="checks-fail">\\u274c</span>'
+      : pr.checks === "pending" ? '<span class="checks-pending">\\u23f3</span>' : '';
+    const mergeableIcon = pr.mergeable ? '<span class="mergeable-yes">\\u2705 Mergeable</span>' : (pr.state === "open" ? '<span class="mergeable-no">\\u26a0\\ufe0f Conflicts</span>' : '');
+
+    let labelsHtml = '';
+    if (pr.labels && pr.labels.length > 0) {
+      labelsHtml = '<div class="pr-labels">' + pr.labels.map(l => '<span class="pr-label-pill">' + escHtml(l) + '</span>').join('') + '</div>';
+    }
+
+    let sessionHtml = '';
+    if (pr.sessionName || pr.sessionId) {
+      sessionHtml = '<div class="pr-session-link">&#x1f916; Created by session: <a onclick="goToSession(\\'' + escHtml(pr.sessionId) + '\\')">' + escHtml(pr.sessionName || pr.sessionId || "unknown") + '</a></div>';
+    }
+
+    return '<div class="pr-card state-' + stateClass + '">'
+      + '<div class="pr-header-row">'
+      + '<a class="pr-title" href="' + escHtml(pr.url) + '" target="_blank" rel="noopener">' + escHtml(pr.title) + '</a>'
+      + '<span class="pr-number">#' + pr.number + '</span>'
+      + '<span class="pr-state-badge ' + stateBadge + '">' + stateBadge + '</span>'
+      + '</div>'
+      + '<div class="pr-meta-row">'
+      + '<span>&#x1f4c1; ' + escHtml(pr.owner + '/' + pr.repo) + '</span>'
+      + '<span>&#x1f464; ' + escHtml(pr.author) + '</span>'
+      + (pr.createdAt ? '<span>&#x1f552; created ' + relativeTimeFromISO(pr.createdAt) + '</span>' : '')
+      + (pr.updatedAt ? '<span>&#x1f504; updated ' + relativeTimeFromISO(pr.updatedAt) + '</span>' : '')
+      + '</div>'
+      + '<div class="pr-stats-row">'
+      + '<span>&#x1f4ac; ' + pr.reviewComments + ' comments</span>'
+      + '<span>&#x1f50d; ' + pr.reviews + ' reviews</span>'
+      + (checksIcon ? '<span>' + checksIcon + ' Checks ' + pr.checks + '</span>' : '')
+      + (mergeableIcon ? '<span>' + mergeableIcon + '</span>' : '')
+      + '</div>'
+      + labelsHtml
+      + sessionHtml
+      + '</div>';
+  }).join('');
+}
+
+function goToSession(sessionId) {
+  if (!sessionId) return;
+  switchMainTab("sessions");
+  // Set search to the session id
+  const searchInput = document.getElementById("search-input");
+  if (searchInput) {
+    searchInput.value = sessionId;
+    searchQuery = sessionId;
+    renderSessions();
+  }
+}
+
+// PR auto-refresh every 30s
+setInterval(() => {
+  if (mainTab === "prs") fetchPRs();
+}, 30000);
+
+// Init
+document.addEventListener("DOMContentLoaded", function() {
+  initFromHash();
+  document.getElementById("sessions-tab-count").textContent = sessions.length || "0";
+});
 </script>
 </body>
 </html>`;
