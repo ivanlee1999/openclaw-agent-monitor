@@ -3,6 +3,22 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { execSync } = require("child_process");
+const { exec: execCb } = require("child_process");
+const { promisify } = require("util");
+const execPromise = promisify(execCb);
+
+async function ghExec(command, timeoutMs = 15000) {
+  try {
+    const { stdout } = await execPromise(command, {
+      encoding: "utf-8",
+      timeout: timeoutMs,
+      maxBuffer: 10 * 1024 * 1024
+    });
+    return stdout;
+  } catch (err) {
+    throw err;
+  }
+}
 
 const app = express();
 const PORT = 3847;
@@ -162,7 +178,7 @@ function readSessions() {
 
 // --- API ---
 
-app.get("/api/sessions", (req, res) => {
+app.get("/api/sessions", async (req, res) => {
   try {
     let sessions = readSessions();
 
@@ -240,7 +256,7 @@ app.get("/api/stats", (_req, res) => {
   }
 });
 
-app.get("/api/sessions/:id/output", (req, res) => {
+app.get("/api/sessions/:id/output", async (req, res) => {
   try {
     if (!fs.existsSync(SESSIONS_FILE)) {
       return res.status(404).json({ error: "Sessions file not found" });
@@ -266,7 +282,7 @@ app.get("/api/sessions/:id/output", (req, res) => {
 
 // --- Session History API (with caching) ---
 
-app.get("/api/sessions/:id/history", (req, res) => {
+app.get("/api/sessions/:id/history", async (req, res) => {
   try {
     const sessionId = req.params.id;
     const jsonlPath = findJsonlPath(sessionId);
@@ -286,7 +302,7 @@ app.get("/api/sessions/:id/history", (req, res) => {
 
 // --- Latest activity API (lightweight, also cached) ---
 
-app.get("/api/sessions/:id/latest", (req, res) => {
+app.get("/api/sessions/:id/latest", async (req, res) => {
   try {
     const sessionId = req.params.id;
     const jsonlPath = findJsonlPath(sessionId);
@@ -483,15 +499,12 @@ function getAllPRsFromJsonls() {
   return allPrs;
 }
 
-function fetchPRDetailsViaGh(prUrl) {
+async function fetchPRDetailsViaGh(prUrl) {
   const cached = prGhCache.get(prUrl);
   if (cached && (Date.now() - cached.fetchedAt) < PR_GH_CACHE_TTL) return cached.data;
 
   try {
-    const json = execSync(
-      `gh pr view "${prUrl}" --json title,state,isDraft,createdAt,updatedAt,author,statusCheckRollup,labels,mergeable,reviews,comments,number`,
-      { encoding: "utf-8", timeout: 15000, stdio: ["pipe", "pipe", "pipe"] }
-    );
+    const json = await ghExec(`gh pr view "${prUrl}" --json title,state,isDraft,createdAt,updatedAt,author,statusCheckRollup,labels,mergeable,reviews,comments,number`);
     const data = JSON.parse(json);
     prGhCache.set(prUrl, { fetchedAt: Date.now(), data });
     return data;
@@ -563,7 +576,7 @@ app.get("/api/prs", async (req, res) => {
   }
 });
 
-app.get("/api/prs/:owner/:repo/:number", (req, res) => {
+app.get("/api/prs/:owner/:repo/:number", async (req, res) => {
   try {
     const { owner, repo, number } = req.params;
     const url = `https://github.com/${owner}/${repo}/pull/${number}`;
@@ -575,10 +588,7 @@ app.get("/api/prs/:owner/:repo/:number", (req, res) => {
     // Fetch detailed info including review comments
     let ghData = null;
     try {
-      const json = execSync(
-        `gh pr view "${url}" --json title,state,isDraft,createdAt,updatedAt,author,statusCheckRollup,labels,mergeable,reviews,comments,number,body`,
-        { encoding: "utf-8", timeout: 15000, stdio: ["pipe", "pipe", "pipe"] }
-      );
+      const json = await ghExec(`gh pr view "${url}" --json title,state,isDraft,createdAt,updatedAt,author,statusCheckRollup,labels,mergeable,reviews,comments,number,body`);
       ghData = JSON.parse(json);
     } catch (err) {
       console.error("gh pr view failed for", url, err.message);
@@ -612,16 +622,13 @@ function isBot(login) {
   return BOT_PATTERNS.some(p => lower.includes(p));
 }
 
-function fetchPRCommentsViaGh(owner, repo, number, prTitle) {
+async function fetchPRCommentsViaGh(owner, repo, number, prTitle) {
   const notifications = [];
   const prInfo = { owner, repo, number, title: prTitle || '' };
 
   // 1. Review comments (inline code comments)
   try {
-    const raw = execSync(
-      `gh api repos/${owner}/${repo}/pulls/${number}/comments --paginate`,
-      { encoding: 'utf-8', timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'] }
-    );
+    const raw = await ghExec(`gh api repos/${owner}/${repo}/pulls/${number}/comments --paginate`);
     const comments = JSON.parse(raw);
     for (const c of comments) {
       notifications.push({
@@ -644,10 +651,7 @@ function fetchPRCommentsViaGh(owner, repo, number, prTitle) {
 
   // 2. Reviews (approve/request changes/comment)
   try {
-    const raw = execSync(
-      `gh api repos/${owner}/${repo}/pulls/${number}/reviews --paginate`,
-      { encoding: 'utf-8', timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'] }
-    );
+    const raw = await ghExec(`gh api repos/${owner}/${repo}/pulls/${number}/reviews --paginate`);
     const reviews = JSON.parse(raw);
     for (const r of reviews) {
       // Skip empty PENDING reviews
@@ -672,10 +676,7 @@ function fetchPRCommentsViaGh(owner, repo, number, prTitle) {
 
   // 3. Issue comments (general PR comments)
   try {
-    const raw = execSync(
-      `gh api repos/${owner}/${repo}/issues/${number}/comments --paginate`,
-      { encoding: 'utf-8', timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'] }
-    );
+    const raw = await ghExec(`gh api repos/${owner}/${repo}/issues/${number}/comments --paginate`);
     const comments = JSON.parse(raw);
     for (const c of comments) {
       notifications.push({
@@ -743,7 +744,7 @@ app.get("/api/notifications", (_req, res) => {
   }
 });
 
-app.get("/api/prs/:owner/:repo/:number/comments", (req, res) => {
+app.get("/api/prs/:owner/:repo/:number/comments", async (req, res) => {
   try {
     const { owner, repo, number } = req.params;
     const url = `https://github.com/${owner}/${repo}/pull/${number}`;
