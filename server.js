@@ -11,6 +11,59 @@ const Database = require("better-sqlite3");
 const DB_PATH = path.join(os.homedir(), ".openclaw", "dashboard.db");
 const db = new Database(DB_PATH);
 
+// Initialize SQLite schema
+db.exec(`
+  CREATE TABLE IF NOT EXISTS prs (
+    url TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    title TEXT,
+    state TEXT,
+    merged INTEGER DEFAULT 0,
+    draft INTEGER DEFAULT 0,
+    created_at TEXT,
+    updated_at TEXT,
+    author TEXT,
+    review_comments INTEGER DEFAULT 0,
+    reviews INTEGER DEFAULT 0,
+    checks TEXT DEFAULT 'unknown',
+    labels TEXT DEFAULT '[]',
+    mergeable INTEGER DEFAULT 0,
+    body TEXT,
+    session_name TEXT,
+    session_id TEXT,
+    fetched_at INTEGER DEFAULT 0,
+    discovered_at INTEGER DEFAULT 0
+  );
+  CREATE TABLE IF NOT EXISTS notifications (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    pr_url TEXT NOT NULL,
+    pr_owner TEXT NOT NULL,
+    pr_repo TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    pr_title TEXT,
+    user TEXT NOT NULL,
+    body TEXT,
+    path TEXT,
+    line INTEGER,
+    diff_hunk TEXT,
+    state TEXT,
+    priority TEXT DEFAULT 'low',
+    created_at TEXT NOT NULL,
+    read INTEGER DEFAULT 0,
+    fetched_at INTEGER DEFAULT 0
+  );
+  CREATE INDEX IF NOT EXISTS idx_prs_state ON prs(state);
+  CREATE INDEX IF NOT EXISTS idx_prs_fetched ON prs(fetched_at);
+  CREATE INDEX IF NOT EXISTS idx_notifications_pr ON notifications(pr_url);
+  CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read);
+`);
+db.pragma('journal_mode = WAL');
+
+
 async function ghExec(command, timeoutMs = 15000) {
   try {
     const { stdout } = await execPromise(command, {
@@ -802,6 +855,53 @@ app.post("/api/notifications/read-all", (_req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+
+
+// Background refresh: simplified version - just log PRs for now
+async function triggerBackgroundRefresh() {
+  console.log("[bg] Refreshing PRs...");
+  try {
+    const prs = getAllPRsFromJsonls();
+    for (const pr of prs) {
+      // Check if PR already in DB
+      const existing = db.prepare("SELECT url, fetched_at, discovered_at FROM prs WHERE url = ?").get(pr.url);
+      const now = Date.now();
+      // Skip if fetched recently (within 5 min)
+      if (existing && (now - existing.fetched_at) < 300000) continue;
+
+      // Fetch from GitHub
+      try {
+        const ghData = await fetchPRDetailsViaGh(pr.url);
+        if (!ghData) continue;
+        const state = ghData.state === "MERGED" ? "merged" : ghData.state === "CLOSED" ? "closed" : "open";
+        const merged = ghData.state === "MERGED" ? 1 : 0;
+
+        const insertArgs = [
+          pr.url, pr.owner, pr.repo, pr.number,
+          ghData.title || "", state, merged, ghData.isDraft ? 1 : 0,
+          ghData.createdAt || "", ghData.updatedAt || "",
+          ghData.author?.login || "",
+          (Array.isArray(ghData.comments) ? ghData.comments.length : (ghData.comments || 0)),
+          (Array.isArray(ghData.reviews) ? ghData.reviews.length : (ghData.reviews?.length || 0)),
+          "unknown", JSON.stringify(ghData.labels?.map(l => l.name) || []),
+          ghData.mergeable === "MERGEABLE" ? 1 : 0,
+          ghData.body || "",
+          pr.sessionName || "", pr.sessionId || "", now, (existing ? existing.discovered_at : now)
+        ];
+        console.log("[bg] Inserting PR", pr.url, "args count:", insertArgs.length);
+        db.prepare(`INSERT OR REPLACE INTO prs (url, owner, repo, number, title, state, merged, draft, created_at, updated_at, author, review_comments, reviews, checks, labels, mergeable, body, session_name, session_id, fetched_at, discovered_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(...insertArgs);
+      } catch (err) {
+        console.error("[bg] Failed to fetch PR", pr.url, err.message);
+      }
+    }
+    console.log("[bg] PR refresh complete");
+  } catch (err) {
+    console.error("[bg] Refresh error:", err.message);
+  }
+}
+
 
 // --- Frontend ---
 
