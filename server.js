@@ -2210,9 +2210,6 @@ setInterval(fetchSessions, 5000);
 setInterval(fetchPRs, 30000);
 setInterval(fetchNotifications, 120000);
 
-// Fetch PR and notification counts after DOM is ready
-setTimeout(() => { fetchPRs(); fetchNotifications(); }, 500);
-
 // Re-fetch output for running sessions periodically
 setInterval(() => {
   if (expandedId) {
@@ -2610,6 +2607,9 @@ setInterval(() => {
 document.addEventListener("DOMContentLoaded", function() {
   initFromHash();
   document.getElementById("sessions-tab-count").textContent = sessions.length || "0";
+  // Fetch PR and notification counts after DOM is ready
+  fetchPRs();
+  fetchNotifications();
 });
 </script>
 </body>
