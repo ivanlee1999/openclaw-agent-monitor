@@ -595,6 +595,175 @@ app.get("/api/prs/:owner/:repo/:number", (req, res) => {
   }
 });
 
+// --- Notifications API ---
+const notificationsCache = { data: null, fetchedAt: 0 };
+const NOTIFICATIONS_CACHE_TTL = 120000; // 2 minutes
+
+const BOT_PATTERNS = ['[bot]', 'copilot', 'github-actions', 'dependabot'];
+
+function isBot(login) {
+  if (!login) return false;
+  const lower = login.toLowerCase();
+  return BOT_PATTERNS.some(p => lower.includes(p));
+}
+
+function fetchPRCommentsViaGh(owner, repo, number, prTitle) {
+  const notifications = [];
+  const prInfo = { owner, repo, number, title: prTitle || '' };
+
+  // 1. Review comments (inline code comments)
+  try {
+    const raw = execSync(
+      `gh api repos/${owner}/${repo}/pulls/${number}/comments --paginate`,
+      { encoding: 'utf-8', timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'] }
+    );
+    const comments = JSON.parse(raw);
+    for (const c of comments) {
+      notifications.push({
+        type: 'review_comment',
+        id: c.id,
+        pr: prInfo,
+        user: c.user?.login || '',
+        body: c.body || '',
+        path: c.path || '',
+        line: c.original_line || c.line || null,
+        diffHunk: c.diff_hunk || '',
+        state: null,
+        createdAt: c.created_at || c.updated_at || '',
+        priority: isBot(c.user?.login) ? 'low' : 'high'
+      });
+    }
+  } catch (err) {
+    console.error(`Failed to fetch review comments for ${owner}/${repo}#${number}:`, err.message);
+  }
+
+  // 2. Reviews (approve/request changes/comment)
+  try {
+    const raw = execSync(
+      `gh api repos/${owner}/${repo}/pulls/${number}/reviews --paginate`,
+      { encoding: 'utf-8', timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'] }
+    );
+    const reviews = JSON.parse(raw);
+    for (const r of reviews) {
+      // Skip empty PENDING reviews
+      if (r.state === 'PENDING' && !r.body) continue;
+      notifications.push({
+        type: 'review',
+        id: r.id,
+        pr: prInfo,
+        user: r.user?.login || '',
+        body: r.body || '',
+        path: null,
+        line: null,
+        diffHunk: null,
+        state: r.state || '',
+        createdAt: r.submitted_at || '',
+        priority: isBot(r.user?.login) ? 'low' : 'high'
+      });
+    }
+  } catch (err) {
+    console.error(`Failed to fetch reviews for ${owner}/${repo}#${number}:`, err.message);
+  }
+
+  // 3. Issue comments (general PR comments)
+  try {
+    const raw = execSync(
+      `gh api repos/${owner}/${repo}/issues/${number}/comments --paginate`,
+      { encoding: 'utf-8', timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'] }
+    );
+    const comments = JSON.parse(raw);
+    for (const c of comments) {
+      notifications.push({
+        type: 'issue_comment',
+        id: c.id,
+        pr: prInfo,
+        user: c.user?.login || '',
+        body: c.body || '',
+        path: null,
+        line: null,
+        diffHunk: null,
+        state: null,
+        createdAt: c.created_at || '',
+        priority: isBot(c.user?.login) ? 'low' : 'high'
+      });
+    }
+  } catch (err) {
+    console.error(`Failed to fetch issue comments for ${owner}/${repo}#${number}:`, err.message);
+  }
+
+  return notifications;
+}
+
+app.get("/api/notifications", (_req, res) => {
+  try {
+    // Check cache
+    if (notificationsCache.data && (Date.now() - notificationsCache.fetchedAt) < NOTIFICATIONS_CACHE_TTL) {
+      return res.json(notificationsCache.data);
+    }
+
+    const prs = getAllPRsFromJsonls();
+    const allNotifications = [];
+
+    // Only fetch comments for PRs created in the last 30 days
+    const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
+
+    for (const pr of prs) {
+      // Check PR age via gh cache or skip ancient ones
+      const ghData = fetchPRDetailsViaGh(pr.url);
+      if (ghData && ghData.createdAt) {
+        const prDate = new Date(ghData.createdAt).getTime();
+        if (prDate < thirtyDaysAgo) continue;
+      }
+
+      const title = ghData?.title || '';
+      const comments = fetchPRCommentsViaGh(pr.owner, pr.repo, pr.number, title);
+      allNotifications.push(...comments);
+    }
+
+    // Sort by time, newest first
+    allNotifications.sort((a, b) => {
+      if (!a.createdAt && !b.createdAt) return 0;
+      if (!a.createdAt) return 1;
+      if (!b.createdAt) return -1;
+      return new Date(b.createdAt) - new Date(a.createdAt);
+    });
+
+    notificationsCache.data = allNotifications;
+    notificationsCache.fetchedAt = Date.now();
+
+    res.json(allNotifications);
+  } catch (err) {
+    console.error("Error fetching notifications:", err.message);
+    res.status(500).json({ error: "Failed to fetch notifications" });
+  }
+});
+
+app.get("/api/prs/:owner/:repo/:number/comments", (req, res) => {
+  try {
+    const { owner, repo, number } = req.params;
+    const url = `https://github.com/${owner}/${repo}/pull/${number}`;
+
+    // Try to get PR title
+    const ghData = fetchPRDetailsViaGh(url);
+    const title = ghData?.title || '';
+
+    const comments = fetchPRCommentsViaGh(owner, repo, parseInt(number), title);
+
+    // Sort newest first
+    comments.sort((a, b) => {
+      if (!a.createdAt && !b.createdAt) return 0;
+      if (!a.createdAt) return 1;
+      if (!b.createdAt) return -1;
+      return new Date(b.createdAt) - new Date(a.createdAt);
+    });
+
+    res.json(comments);
+  } catch (err) {
+    console.error("Error fetching PR comments:", err.message);
+    res.status(500).json({ error: "Failed to fetch PR comments" });
+  }
+});
+
 // --- Frontend ---
 
 const HTML = `<!DOCTYPE html>
@@ -1227,6 +1396,125 @@ a:hover { text-decoration: underline; }
 .checks-pending { color: var(--killed); }
 .mergeable-yes { color: var(--completed); }
 .mergeable-no { color: var(--failed); }
+
+/* Notifications view */
+.notifications-view { display: none; }
+.notifications-view.active { display: block; }
+
+.notif-summary {
+  display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+  margin-bottom: 16px; font-size: 13px; color: var(--text-secondary);
+}
+.notif-summary .notif-stat {
+  display: inline-flex; align-items: center; gap: 5px;
+}
+.notif-summary .notif-stat-value {
+  font-weight: 700; color: var(--text-heading);
+}
+.notif-summary .notif-stat-value.high-val { color: var(--failed); }
+.notif-summary .notif-stat-value.low-val { color: var(--text-muted); }
+
+.notif-filter-bar {
+  display: flex; gap: 0; margin-bottom: 20px; flex-wrap: wrap; align-items: center;
+  border-bottom: 1px solid var(--border); padding-bottom: 0;
+}
+
+.notif-card {
+  background: var(--card-bg); border: 1px solid var(--border); border-radius: 2px;
+  border-left: 4px solid var(--text-muted); padding: 16px 20px;
+  transition: background 0.1s; margin-bottom: 10px;
+}
+.notif-card:hover { background: var(--card-hover); }
+.notif-card.priority-high { border-left-color: var(--failed); }
+.notif-card.priority-low { border-left-color: var(--text-muted); }
+
+.notif-header {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px;
+}
+.notif-user {
+  font-size: 14px; font-weight: 600; color: var(--text-heading);
+}
+.notif-bot-badge {
+  font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px;
+  padding: 1px 6px; border-radius: 2px; color: var(--text-muted);
+  background: var(--surface); border: 1px solid var(--border);
+}
+.notif-time {
+  font-size: 12px; color: var(--text-muted); margin-left: auto; font-family: var(--mono);
+}
+.notif-review-state {
+  font-size: 12px; font-weight: 600; margin-left: 4px;
+}
+
+.notif-pr-context {
+  font-size: 12px; color: var(--text-secondary); margin-bottom: 8px;
+}
+.notif-pr-context a { color: var(--link); font-size: 12px; }
+
+.notif-body {
+  font-size: 13px; color: var(--text-primary); line-height: 1.6;
+  white-space: pre-wrap; word-break: break-word;
+}
+.notif-body-code {
+  font-family: var(--mono); font-size: 12px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 2px; padding: 8px 12px;
+  line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+}
+
+.notif-file-info {
+  font-size: 11px; color: var(--info-accent); font-family: var(--mono);
+  margin-bottom: 6px;
+}
+
+.notif-diff-hunk {
+  font-family: var(--mono); font-size: 11px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 2px; padding: 8px 12px;
+  max-height: 0; overflow: hidden; transition: max-height 0.3s ease;
+  margin-top: 8px; line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+  color: var(--text-secondary);
+}
+.notif-diff-hunk.open { max-height: 300px; overflow-y: auto; }
+.notif-diff-toggle {
+  font-size: 11px; color: var(--accent); cursor: pointer; margin-top: 6px;
+  display: inline-block; font-weight: 500;
+}
+.notif-diff-toggle:hover { text-decoration: underline; }
+
+.notif-loading {
+  text-align: center; padding: 40px; color: var(--text-muted); font-size: 14px;
+}
+
+/* PR card expansion */
+.pr-card { cursor: pointer; transition: background 0.1s; }
+.pr-card.expanded { border-left-width: 4px; }
+.pr-expanded-content {
+  display: none; border-top: 1px solid var(--border); margin-top: 12px;
+  padding-top: 14px;
+}
+.pr-expanded-content.open { display: block; }
+.pr-body-section {
+  margin-bottom: 16px;
+}
+.pr-body-title {
+  font-size: 11px; font-weight: 600; color: var(--text-secondary);
+  text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 8px;
+}
+.pr-body-text {
+  font-size: 13px; color: var(--text-primary); line-height: 1.6;
+  white-space: pre-wrap; word-break: break-word;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 2px;
+  padding: 12px 16px; max-height: 300px; overflow-y: auto;
+}
+.pr-comments-section { margin-bottom: 16px; }
+.pr-files-section {
+  margin-bottom: 12px; font-size: 13px; color: var(--text-secondary);
+}
+.pr-github-link {
+  display: inline-block; font-size: 13px; color: var(--link); margin-top: 8px;
+}
+.pr-comments-loading {
+  font-size: 12px; color: var(--text-muted); font-style: italic; padding: 8px 0;
+}
 </style>
 </head>
 <body>
@@ -1255,6 +1543,7 @@ a:hover { text-decoration: underline; }
   <div class="main-tabs">
     <button class="main-tab active" id="tab-sessions" onclick="switchMainTab('sessions')">&#x1f4cb; Sessions <span class="tab-count" id="sessions-tab-count">0</span></button>
     <button class="main-tab" id="tab-prs" onclick="switchMainTab('prs')">&#x1f517; Pull Requests <span class="tab-count" id="prs-tab-count">0</span></button>
+    <button class="main-tab" id="tab-notifications" onclick="switchMainTab('notifications')">&#x1f514; Notifications <span class="tab-count" id="notifications-tab-count">0</span></button>
   </div>
 
   <div class="sessions-view" id="sessions-view">
@@ -1282,6 +1571,18 @@ a:hover { text-decoration: underline; }
       <button class="filter-btn" data-pr-filter="draft">Draft</button>
     </div>
     <div id="prs-list"></div>
+  </div>
+
+  <div class="notifications-view" id="notifications-view">
+    <div class="notif-summary" id="notif-summary"></div>
+    <div class="notif-filter-bar" id="notif-filter-bar">
+      <button class="filter-btn active" data-notif-filter="all">All</button>
+      <button class="filter-btn" data-notif-filter="high">High Priority</button>
+      <button class="filter-btn" data-notif-filter="low">Low Priority</button>
+      <button class="filter-btn" data-notif-filter="review">Reviews</button>
+      <button class="filter-btn" data-notif-filter="comment">Comments</button>
+    </div>
+    <div id="notifications-list"></div>
   </div>
 </div>
 
@@ -1884,13 +2185,18 @@ let prFetchInProgress = false;
 
 function switchMainTab(tab) {
   mainTab = tab;
-  window.location.hash = tab === "sessions" ? "sessions" : "prs";
+  window.location.hash = tab;
   document.getElementById("tab-sessions").classList.toggle("active", tab === "sessions");
   document.getElementById("tab-prs").classList.toggle("active", tab === "prs");
+  document.getElementById("tab-notifications").classList.toggle("active", tab === "notifications");
   document.getElementById("sessions-view").classList.toggle("hidden", tab !== "sessions");
   document.getElementById("prs-view").classList.toggle("active", tab === "prs");
+  document.getElementById("notifications-view").classList.toggle("active", tab === "notifications");
   if (tab === "prs" && prs.length === 0 && !prFetchInProgress) {
     fetchPRs();
+  }
+  if (tab === "notifications" && notifications.length === 0 && !notifFetchInProgress) {
+    fetchNotifications();
   }
 }
 
@@ -1898,6 +2204,7 @@ function switchMainTab(tab) {
 function initFromHash() {
   const hash = window.location.hash.replace("#", "") || "sessions";
   if (hash === "prs") switchMainTab("prs");
+  else if (hash === "notifications") switchMainTab("notifications");
   else switchMainTab("sessions");
 }
 
@@ -1946,6 +2253,9 @@ function renderPRSummary() {
     + (closed > 0 ? '<span class="pr-stat"><span class="pr-stat-value">' + closed + '</span> Closed</span>' : '');
 }
 
+let expandedPrId = null;
+let prCommentsCache = {};
+
 function renderPRs() {
   const list = document.getElementById("prs-list");
   let filtered = prs;
@@ -1961,6 +2271,8 @@ function renderPRs() {
   }
 
   list.innerHTML = filtered.map(pr => {
+    const prKey = pr.owner + '/' + pr.repo + '/' + pr.number;
+    const isExpanded = expandedPrId === prKey;
     const stateClass = pr.draft ? "draft" : pr.merged ? "merged" : pr.state;
     const stateBadge = pr.draft ? "draft" : pr.merged ? "merged" : pr.state;
     const checksIcon = pr.checks === "passing" ? '<span class="checks-pass">\\u2705</span>'
@@ -1978,9 +2290,14 @@ function renderPRs() {
       sessionHtml = '<div class="pr-session-link">&#x1f916; Created by session: <a onclick="goToSession(\\'' + escHtml(pr.sessionId) + '\\')">' + escHtml(pr.sessionName || pr.sessionId || "unknown") + '</a></div>';
     }
 
-    return '<div class="pr-card state-' + stateClass + '">'
+    let expandedHtml = '';
+    if (isExpanded) {
+      expandedHtml = '<div class="pr-expanded-content open">' + getPRExpandedContent(pr) + '</div>';
+    }
+
+    return '<div class="pr-card state-' + stateClass + (isExpanded ? ' expanded' : '') + '" onclick="togglePR(\\'' + escHtml(prKey) + '\\', \\'' + escHtml(pr.owner) + '\\', \\'' + escHtml(pr.repo) + '\\', ' + pr.number + ', event)">'
       + '<div class="pr-header-row">'
-      + '<a class="pr-title" href="' + escHtml(pr.url) + '" target="_blank" rel="noopener">' + escHtml(pr.title) + '</a>'
+      + '<a class="pr-title" href="' + escHtml(pr.url) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()">' + escHtml(pr.title) + '</a>'
       + '<span class="pr-number">#' + pr.number + '</span>'
       + '<span class="pr-state-badge ' + stateBadge + '">' + stateBadge + '</span>'
       + '</div>'
@@ -1998,8 +2315,82 @@ function renderPRs() {
       + '</div>'
       + labelsHtml
       + sessionHtml
+      + expandedHtml
       + '</div>';
   }).join('');
+}
+
+async function togglePR(prKey, owner, repo, number, event) {
+  // Don't toggle if clicking a link
+  if (event && (event.target.tagName === 'A' || event.target.closest('a'))) return;
+  if (event && event.target.closest('.notif-diff-toggle')) return;
+
+  if (expandedPrId === prKey) {
+    expandedPrId = null;
+    renderPRs();
+    return;
+  }
+  expandedPrId = prKey;
+  renderPRs();
+
+  // Fetch PR details and comments
+  if (!prCommentsCache[prKey]) {
+    try {
+      const [detailRes, commentsRes] = await Promise.all([
+        fetch('/api/prs/' + encodeURIComponent(owner) + '/' + encodeURIComponent(repo) + '/' + number),
+        fetch('/api/prs/' + encodeURIComponent(owner) + '/' + encodeURIComponent(repo) + '/' + number + '/comments')
+      ]);
+      const detail = detailRes.ok ? await detailRes.json() : null;
+      const comments = commentsRes.ok ? await commentsRes.json() : [];
+      prCommentsCache[prKey] = { detail, comments };
+    } catch (err) {
+      console.error('Failed to fetch PR details:', err);
+      prCommentsCache[prKey] = { detail: null, comments: [] };
+    }
+    if (expandedPrId === prKey) renderPRs();
+  }
+}
+
+function getPRExpandedContent(pr) {
+  const prKey = pr.owner + '/' + pr.repo + '/' + pr.number;
+  const cached = prCommentsCache[prKey];
+
+  if (!cached) {
+    return '<div class="pr-comments-loading">&#x23f3; Loading PR details...</div>';
+  }
+
+  let html = '';
+
+  // PR Description
+  if (cached.detail && cached.detail.body) {
+    html += '<div class="pr-body-section">'
+      + '<div class="pr-body-title">\\u{1f4dd} Description</div>'
+      + '<div class="pr-body-text">' + escHtml(cached.detail.body) + '</div>'
+      + '</div>';
+  }
+
+  // Files changed count
+  if (cached.detail && cached.detail.reviewComments !== undefined) {
+    html += '<div class="pr-files-section">\\u{1f4c2} ' + (cached.detail.reviewComments + cached.detail.reviews) + ' total comments & reviews</div>';
+  }
+
+  // Comments & Reviews
+  if (cached.comments && cached.comments.length > 0) {
+    html += '<div class="pr-comments-section">'
+      + '<div class="pr-body-title">\\u{1f4ac} Comments & Reviews (' + cached.comments.length + ')</div>';
+    for (let i = 0; i < cached.comments.length; i++) {
+      const n = cached.comments[i];
+      html += renderNotifCard(n, 'pr-' + prKey.replace(/\\//g, '-') + '-' + i);
+    }
+    html += '</div>';
+  } else {
+    html += '<div class="pr-comments-loading">No comments or reviews yet</div>';
+  }
+
+  // GitHub link
+  html += '<a class="pr-github-link" href="' + escHtml(pr.url) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()">\\u{1f517} View on GitHub &rarr;</a>';
+
+  return html;
 }
 
 function goToSession(sessionId) {
@@ -2018,6 +2409,140 @@ function goToSession(sessionId) {
 setInterval(() => {
   if (mainTab === "prs") fetchPRs();
 }, 30000);
+
+// --- Notifications Tab ---
+let notifications = [];
+let notifFilter = "all";
+let notifFetchInProgress = false;
+
+// Notif filter click handler
+document.getElementById("notif-filter-bar").addEventListener("click", (e) => {
+  if (!e.target.matches("[data-notif-filter]")) return;
+  document.querySelectorAll("[data-notif-filter]").forEach(b => b.classList.remove("active"));
+  e.target.classList.add("active");
+  notifFilter = e.target.dataset.notifFilter;
+  renderNotifications();
+});
+
+async function fetchNotifications() {
+  if (notifFetchInProgress) return;
+  notifFetchInProgress = true;
+  const list = document.getElementById("notifications-list");
+  if (notifications.length === 0) list.innerHTML = '<div class="notif-loading">&#x23f3; Loading notifications...</div>';
+  try {
+    const res = await fetch("/api/notifications");
+    if (!res.ok) throw new Error("fetch failed");
+    notifications = await res.json();
+    renderNotifSummary();
+    renderNotifications();
+    document.getElementById("notifications-tab-count").textContent = notifications.length;
+  } catch (err) {
+    console.error("Failed to fetch notifications:", err);
+    list.innerHTML = '<div class="notif-loading">Failed to load notifications</div>';
+  } finally {
+    notifFetchInProgress = false;
+  }
+}
+
+function renderNotifSummary() {
+  const total = notifications.length;
+  const high = notifications.filter(n => n.priority === "high").length;
+  const low = notifications.filter(n => n.priority === "low").length;
+  document.getElementById("notif-summary").innerHTML =
+    '<span class="notif-stat"><span class="notif-stat-value">' + total + '</span> Total</span>'
+    + '<span class="notif-stat"><span class="notif-stat-value high-val">' + high + '</span> High Priority</span>'
+    + '<span class="notif-stat"><span class="notif-stat-value low-val">' + low + '</span> Low Priority</span>';
+}
+
+function renderNotifications() {
+  const list = document.getElementById("notifications-list");
+  let filtered = notifications;
+  if (notifFilter === "high") filtered = notifications.filter(n => n.priority === "high");
+  else if (notifFilter === "low") filtered = notifications.filter(n => n.priority === "low");
+  else if (notifFilter === "review") filtered = notifications.filter(n => n.type === "review");
+  else if (notifFilter === "comment") filtered = notifications.filter(n => n.type === "review_comment" || n.type === "issue_comment");
+
+  if (filtered.length === 0) {
+    list.innerHTML = '<div class="empty-state"><div class="icon">\\u{1f514}</div>'
+      + '<h2>No notifications</h2><p>' + (notifications.length === 0 ? 'No comments or reviews on agent PRs yet' : 'No notifications match this filter') + '</p></div>';
+    return;
+  }
+
+  list.innerHTML = filtered.map((n, i) => renderNotifCard(n, i)).join('');
+}
+
+function renderNotifCard(n, idx) {
+  const bot = isBot(n.user);
+  const priorityClass = n.priority === "high" ? "priority-high" : "priority-low";
+
+  let stateIcon = '';
+  if (n.type === "review") {
+    if (n.state === "APPROVED") stateIcon = '<span class="notif-review-state" style="color:var(--completed)">\\u2705 Approved</span>';
+    else if (n.state === "CHANGES_REQUESTED") stateIcon = '<span class="notif-review-state" style="color:var(--failed)">\\u274c Changes Requested</span>';
+    else if (n.state === "COMMENTED") stateIcon = '<span class="notif-review-state" style="color:var(--text-secondary)">\\u{1f4ac} Commented</span>';
+    else if (n.state === "DISMISSED") stateIcon = '<span class="notif-review-state" style="color:var(--text-muted)">Dismissed</span>';
+    else stateIcon = '<span class="notif-review-state" style="color:var(--text-muted)">' + escHtml(n.state) + '</span>';
+  }
+
+  let typeLabel = '';
+  if (n.type === "review_comment") typeLabel = "Review Comment";
+  else if (n.type === "review") typeLabel = "Review";
+  else if (n.type === "issue_comment") typeLabel = "Comment";
+
+  let fileInfo = '';
+  if (n.type === "review_comment" && n.path) {
+    fileInfo = '<div class="notif-file-info">\\u{1f4c4} ' + escHtml(n.path) + (n.line ? ':' + n.line : '') + '</div>';
+  }
+
+  let diffHunk = '';
+  if (n.type === "review_comment" && n.diffHunk) {
+    diffHunk = '<div class="notif-diff-toggle" onclick="event.stopPropagation(); toggleNotifDiff(\\'' + idx + '\\')">\\u25b6 Show diff context</div>'
+      + '<div class="notif-diff-hunk" id="notif-diff-' + idx + '">' + escHtml(n.diffHunk) + '</div>';
+  }
+
+  const bodyHasCode = n.body && (n.body.includes('\`') || n.body.includes('    ') || n.body.includes('\\t'));
+  const bodyClass = bodyHasCode ? 'notif-body-code' : 'notif-body';
+  const bodyContent = n.body ? '<div class="' + bodyClass + '">' + escHtml(n.body) + '</div>' : '';
+
+  const prCtx = n.pr ? '<div class="notif-pr-context">' + escHtml(typeLabel) + ' on <a href="https://github.com/' + escHtml(n.pr.owner) + '/' + escHtml(n.pr.repo) + '/pull/' + n.pr.number + '" target="_blank" rel="noopener">' + escHtml(n.pr.owner + '/' + n.pr.repo) + '#' + n.pr.number + '</a> &mdash; ' + escHtml(truncate(n.pr.title, 60)) + '</div>' : '';
+
+  return '<div class="notif-card ' + priorityClass + '">'
+    + '<div class="notif-header">'
+    + '<span class="notif-user">' + escHtml(n.user) + '</span>'
+    + (bot ? '<span class="notif-bot-badge">BOT</span>' : '')
+    + stateIcon
+    + '<span class="notif-time" title="' + escHtml(n.createdAt) + '">' + relativeTimeFromISO(n.createdAt) + '</span>'
+    + '</div>'
+    + prCtx
+    + fileInfo
+    + bodyContent
+    + diffHunk
+    + '</div>';
+}
+
+function isBot(login) {
+  if (!login) return false;
+  const lower = login.toLowerCase();
+  return ['[bot]', 'copilot', 'github-actions', 'dependabot'].some(p => lower.includes(p));
+}
+
+function toggleNotifDiff(idx) {
+  const el = document.getElementById("notif-diff-" + idx);
+  if (!el) return;
+  const toggle = el.previousElementSibling;
+  if (el.classList.contains("open")) {
+    el.classList.remove("open");
+    if (toggle) toggle.innerHTML = "\\u25b6 Show diff context";
+  } else {
+    el.classList.add("open");
+    if (toggle) toggle.innerHTML = "\\u25bc Hide diff context";
+  }
+}
+
+// Notifications auto-refresh every 2 minutes
+setInterval(() => {
+  if (mainTab === "notifications") fetchNotifications();
+}, 120000);
 
 // Init
 document.addEventListener("DOMContentLoaded", function() {
