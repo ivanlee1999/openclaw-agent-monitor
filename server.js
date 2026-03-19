@@ -856,6 +856,17 @@ app.post("/api/notifications/read-all", (_req, res) => {
   }
 });
 
+app.post("/api/notifications/refresh", async (_req, res) => {
+  try {
+    console.log("[api] Manual notification refresh triggered");
+    // Trigger refresh in background
+    triggerNotificationRefresh().catch(err => console.error("[api] Notification refresh failed:", err.message));
+    res.json({ success: true, message: "Notification refresh triggered" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 
 // Background refresh: simplified version - just log PRs for now
@@ -897,6 +908,8 @@ async function triggerBackgroundRefresh() {
       }
     }
     console.log("[bg] PR refresh complete");
+    // Trigger notification refresh immediately after PR refresh to capture comments on new PRs
+    triggerNotificationRefresh().catch(err => console.error("[bg] Failed to trigger notification refresh:", err.message));
   } catch (err) {
     console.error("[bg] Refresh error:", err.message);
   }
@@ -941,9 +954,9 @@ async function triggerNotificationRefresh() {
   }
 }
 
-// Run notification refresh 30s after startup (after PR refresh), then every 5 minutes
+// Run notification refresh 30s after startup (after PR refresh), then every 2 minutes
 setTimeout(() => triggerNotificationRefresh().catch(console.error), 30000);
-setInterval(() => triggerNotificationRefresh().catch(console.error), 300000);
+setInterval(() => triggerNotificationRefresh().catch(console.error), 120000);
 
 // --- Frontend ---
 
