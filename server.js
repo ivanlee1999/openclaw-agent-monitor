@@ -9,7 +9,7 @@ const execPromise = promisify(execCb);
 const Database = require("better-sqlite3");
 
 const DB_PATH = path.join(os.homedir(), ".openclaw", "dashboard.db");
-const db = new Database(DB_PATH, { readonly: true });
+const db = new Database(DB_PATH);
 
 async function ghExec(command, timeoutMs = 15000) {
   try {
@@ -762,18 +762,31 @@ app.use(express.json());
 
 app.post("/api/notifications/:id/read", (req, res) => {
   const id = req.params.id;
-  readNotifications.add(id);
-  res.json({ success: true, id });
+  try {
+    db.prepare("UPDATE notifications SET read = 1 WHERE id = ?").run(id);
+    res.json({ success: true, id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/notifications/:id/unread", (req, res) => {
+  const id = req.params.id;
+  try {
+    db.prepare("UPDATE notifications SET read = 0 WHERE id = ?").run(id);
+    res.json({ success: true, id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post("/api/notifications/read-all", (_req, res) => {
-  // Mark all currently cached notifications as read
-  if (notificationsCache.data && Array.isArray(notificationsCache.data)) {
-    for (const n of notificationsCache.data) {
-      readNotifications.add(String(n.id));
-    }
+  try {
+    const result = db.prepare("UPDATE notifications SET read = 1 WHERE read = 0").run();
+    res.json({ success: true, count: result.changes });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-  res.json({ success: true, count: readNotifications.size });
 });
 
 // --- Frontend ---
@@ -1431,6 +1444,11 @@ a:hover { text-decoration: underline; }
   border-bottom: 1px solid var(--border); padding-bottom: 0;
 }
 
+
+.notif-unread { background: var(--card-hover); }
+.notif-read { opacity: 0.6; }
+.notif-read-btn { cursor: pointer; border: none; background: none; color: var(--text-muted); font-size: 16px; padding: 4px 8px; border-radius: 4px; }
+.notif-read-btn:hover { color: var(--accent); background: var(--bg-surface, var(--surface)); }
 .notif-card {
   background: var(--card-bg); border: 1px solid var(--border); border-radius: 2px;
   border-left: 4px solid var(--text-muted); padding: 16px 20px;
@@ -1593,6 +1611,7 @@ a:hover { text-decoration: underline; }
       <button class="filter-btn" data-notif-filter="low">Low Priority</button>
       <button class="filter-btn" data-notif-filter="review">Reviews</button>
       <button class="filter-btn" data-notif-filter="comment">Comments</button>
+      <button class="filter-btn" data-notif-filter="unread">Unread</button>
     </div>
     <div id="notifications-list"></div>
   </div>
@@ -1786,6 +1805,17 @@ function processAnsi(text) {
   return result;
 }
 
+
+async function markAllNotificationsRead() {
+  await fetch("/api/notifications/read-all", { method: "POST" });
+  fetchNotifications();
+}
+
+async function toggleNotifRead(id, currentRead) {
+  const endpoint = currentRead ? "unread" : "read";
+  await fetch("/api/notifications/" + id + "/" + endpoint, { method: "POST" });
+  fetchNotifications();
+}
 // --- Tool icons ---
 function toolIcon(tool) {
   const icons = {
@@ -2459,6 +2489,7 @@ async function fetchNotifications() {
 function renderNotifSummary() {
   const total = notifications.length;
   const high = notifications.filter(n => n.priority === "high").length;
+  const unread = notifications.filter(n => !n.read).length;
   const low = notifications.filter(n => n.priority === "low").length;
   document.getElementById("notif-summary").innerHTML =
     '<span class="notif-stat"><span class="notif-stat-value">' + total + '</span> Total</span>'
