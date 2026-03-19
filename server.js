@@ -700,44 +700,25 @@ async function fetchPRCommentsViaGh(owner, repo, number, prTitle) {
   return notifications;
 }
 
-app.get("/api/notifications", async (_req, res) => {
+app.get("/api/notifications", (_req, res) => {
   try {
-    // Check cache
-    if (notificationsCache.data && (Date.now() - notificationsCache.fetchedAt) < NOTIFICATIONS_CACHE_TTL) {
-      return res.json(notificationsCache.data);
-    }
-
-    const prs = getAllPRsFromJsonls();
-    const allNotifications = [];
-
-    // Only fetch comments for PRs created in the last 30 days
-    const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
-
-    for (const pr of prs) {
-      // Check PR age via gh cache or skip ancient ones
-      const ghData = await fetchPRDetailsViaGh(pr.url);
-      if (ghData && ghData.createdAt) {
-        const prDate = new Date(ghData.createdAt).getTime();
-        if (prDate < thirtyDaysAgo) continue;
-      }
-
-      const title = ghData?.title || '';
-      const comments = await fetchPRCommentsViaGh(pr.owner, pr.repo, pr.number, title);
-      allNotifications.push(...comments);
-    }
-
-    // Sort by time, newest first
-    allNotifications.sort((a, b) => {
-      if (!a.createdAt && !b.createdAt) return 0;
-      if (!a.createdAt) return 1;
-      if (!b.createdAt) return -1;
-      return new Date(b.createdAt) - new Date(a.createdAt);
-    });
-
-    notificationsCache.data = allNotifications;
-    notificationsCache.fetchedAt = Date.now();
-
-    res.json(allNotifications);
+    // Read from SQLite (instant) — background refresh populates the data
+    const rows = db.prepare("SELECT * FROM notifications ORDER BY created_at DESC").all();
+    const results = rows.map(row => ({
+      type: row.type,
+      id: row.id,
+      pr: { owner: row.pr_owner, repo: row.pr_repo, number: row.pr_number, title: row.pr_title || "" },
+      user: row.user,
+      body: row.body || "",
+      path: row.path || undefined,
+      line: row.line || undefined,
+      diffHunk: row.diff_hunk || undefined,
+      state: row.state || undefined,
+      priority: row.priority || "low",
+      createdAt: row.created_at,
+      read: row.read === 1
+    }));
+    res.json(results);
   } catch (err) {
     console.error("Error fetching notifications:", err.message);
     res.status(500).json({ error: "Failed to fetch notifications" });
