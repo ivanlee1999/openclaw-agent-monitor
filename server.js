@@ -557,22 +557,36 @@ function formatPRResponse(pr, ghData) {
 
 // --- PR API ---
 
-app.get("/api/prs", async (req, res) => {
+app.get("/api/prs", (req, res) => {
   try {
-    const prs = getAllPRsFromJsonls();
-    const results = [];
-    // Fetch gh details for each PR (sequentially to avoid hammering)
-    for (const pr of prs) {
-      const ghData = await fetchPRDetailsViaGh(pr.url);
-      results.push(formatPRResponse(pr, ghData));
+    // Read from SQLite (instant) — background refresh populates the data
+    const rows = db.prepare("SELECT * FROM prs ORDER BY created_at DESC").all();
+    const results = rows.map(row => ({
+      url: row.url,
+      owner: row.owner,
+      repo: row.repo,
+      number: row.number,
+      title: row.title || "",
+      state: row.state || "unknown",
+      merged: row.merged === 1,
+      draft: row.draft === 1,
+      createdAt: row.created_at || "",
+      updatedAt: row.updated_at || "",
+      author: row.author || "",
+      reviewComments: row.review_comments || 0,
+      reviews: row.reviews || 0,
+      checks: row.checks || "unknown",
+      labels: JSON.parse(row.labels || "[]"),
+      mergeable: row.mergeable === 1,
+      sessionName: row.session_name || "",
+      sessionId: row.session_id || ""
+    }));
+
+    // If DB is empty, trigger background refresh
+    if (rows.length === 0) {
+      triggerBackgroundRefresh().catch(() => {});
     }
-    // Sort by createdAt descending
-    results.sort((a, b) => {
-      if (!a.createdAt && !b.createdAt) return 0;
-      if (!a.createdAt) return 1;
-      if (!b.createdAt) return -1;
-      return new Date(b.createdAt) - new Date(a.createdAt);
-    });
+
     res.json(results);
   } catch (err) {
     console.error("Error fetching PRs:", err.message);
