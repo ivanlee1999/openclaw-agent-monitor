@@ -559,7 +559,7 @@ app.get("/api/prs", async (req, res) => {
     const results = [];
     // Fetch gh details for each PR (sequentially to avoid hammering)
     for (const pr of prs) {
-      const ghData = fetchPRDetailsViaGh(pr.url);
+      const ghData = await fetchPRDetailsViaGh(pr.url);
       results.push(formatPRResponse(pr, ghData));
     }
     // Sort by createdAt descending
@@ -700,7 +700,7 @@ async function fetchPRCommentsViaGh(owner, repo, number, prTitle) {
   return notifications;
 }
 
-app.get("/api/notifications", (_req, res) => {
+app.get("/api/notifications", async (_req, res) => {
   try {
     // Check cache
     if (notificationsCache.data && (Date.now() - notificationsCache.fetchedAt) < NOTIFICATIONS_CACHE_TTL) {
@@ -715,14 +715,14 @@ app.get("/api/notifications", (_req, res) => {
 
     for (const pr of prs) {
       // Check PR age via gh cache or skip ancient ones
-      const ghData = fetchPRDetailsViaGh(pr.url);
+      const ghData = await fetchPRDetailsViaGh(pr.url);
       if (ghData && ghData.createdAt) {
         const prDate = new Date(ghData.createdAt).getTime();
         if (prDate < thirtyDaysAgo) continue;
       }
 
       const title = ghData?.title || '';
-      const comments = fetchPRCommentsViaGh(pr.owner, pr.repo, pr.number, title);
+      const comments = await fetchPRCommentsViaGh(pr.owner, pr.repo, pr.number, title);
       allNotifications.push(...comments);
     }
 
@@ -750,10 +750,10 @@ app.get("/api/prs/:owner/:repo/:number/comments", async (req, res) => {
     const url = `https://github.com/${owner}/${repo}/pull/${number}`;
 
     // Try to get PR title
-    const ghData = fetchPRDetailsViaGh(url);
+    const ghData = await fetchPRDetailsViaGh(url);
     const title = ghData?.title || '';
 
-    const comments = fetchPRCommentsViaGh(owner, repo, parseInt(number), title);
+    const comments = await fetchPRCommentsViaGh(owner, repo, parseInt(number), title);
 
     // Sort newest first
     comments.sort((a, b) => {
@@ -768,6 +768,27 @@ app.get("/api/prs/:owner/:repo/:number/comments", async (req, res) => {
     console.error("Error fetching PR comments:", err.message);
     res.status(500).json({ error: "Failed to fetch PR comments" });
   }
+});
+
+// --- Notification read state (in-memory) ---
+const readNotifications = new Set();
+
+app.use(express.json());
+
+app.post("/api/notifications/:id/read", (req, res) => {
+  const id = req.params.id;
+  readNotifications.add(id);
+  res.json({ success: true, id });
+});
+
+app.post("/api/notifications/read-all", (_req, res) => {
+  // Mark all currently cached notifications as read
+  if (notificationsCache.data && Array.isArray(notificationsCache.data)) {
+    for (const n of notificationsCache.data) {
+      readNotifications.add(String(n.id));
+    }
+  }
+  res.json({ success: true, count: readNotifications.size });
 });
 
 // --- Frontend ---
