@@ -2206,7 +2206,11 @@ function fetchPreviews() {
 }
 
 fetchSessions();
+fetchPRs();
+fetchNotifications();
 setInterval(fetchSessions, 5000);
+setInterval(fetchPRs, 30000);
+setInterval(fetchNotifications, 120000);
 
 // Re-fetch output for running sessions periodically
 setInterval(() => {
