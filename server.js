@@ -561,7 +561,7 @@ async function fetchPRDetailsViaGh(prUrl) {
   if (cached && (Date.now() - cached.fetchedAt) < PR_GH_CACHE_TTL) return cached.data;
 
   try {
-    const json = await ghExec(`gh pr view "${prUrl}" --json title,state,isDraft,createdAt,updatedAt,author,statusCheckRollup,labels,mergeable,reviews,comments,number`);
+    const json = await ghExec(`gh pr view "${prUrl}" --json title,state,isDraft,createdAt,updatedAt,author,statusCheckRollup,labels,mergeable,reviews,comments,number,body`);
     const data = JSON.parse(json);
     prGhCache.set(prUrl, { fetchedAt: Date.now(), data });
     return data;
