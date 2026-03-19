@@ -954,6 +954,10 @@ async function triggerNotificationRefresh() {
   }
 }
 
+// Run PR refresh every 5 minutes + on startup
+setTimeout(() => triggerBackgroundRefresh().catch(console.error), 5000);
+setInterval(() => triggerBackgroundRefresh().catch(console.error), 300000);
+
 // Run notification refresh 30s after startup (after PR refresh), then every 2 minutes
 setTimeout(() => triggerNotificationRefresh().catch(console.error), 30000);
 setInterval(() => triggerNotificationRefresh().catch(console.error), 120000);
