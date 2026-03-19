@@ -337,9 +337,14 @@ app.get("/api/sessions/:id/latest", (req, res) => {
 });
 
 // --- PR Extraction from JSONL files ---
+// Full PR list cache (stale-while-revalidate)
+let prListCache = { data: null, fetchedAt: 0, refreshing: false };
+const PR_LIST_CACHE_TTL = 300000; // 5 minutes
+const PR_LIST_STALE_TTL = 600000; // serve stale for 10 minutes while refreshing
+
 const prJsonlCache = new Map(); // key: jsonlPath -> { mtimeMs, prs: [{url, sessionId, sessionName}] }
 const prGhCache = new Map(); // key: prUrl -> { fetchedAt, data }
-const PR_GH_CACHE_TTL = 60000; // 60 seconds
+const PR_GH_CACHE_TTL = 300000; // 5 minutes
 const PR_URL_RE = /https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/g;
 
 function getAllJsonlPaths() {
@@ -596,8 +601,8 @@ app.get("/api/prs/:owner/:repo/:number", (req, res) => {
 });
 
 // --- Notifications API ---
-const notificationsCache = { data: null, fetchedAt: 0 };
-const NOTIFICATIONS_CACHE_TTL = 120000; // 2 minutes
+const notificationsCache = { data: null, fetchedAt: 0, refreshing: false };
+const NOTIFICATIONS_CACHE_TTL = 300000; // 5 minutes // 2 minutes
 
 const BOT_PATTERNS = ['[bot]', 'copilot', 'github-actions', 'dependabot'];
 
