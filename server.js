@@ -6,6 +6,10 @@ const { execSync } = require("child_process");
 const { exec: execCb } = require("child_process");
 const { promisify } = require("util");
 const execPromise = promisify(execCb);
+const Database = require("better-sqlite3");
+
+const DB_PATH = path.join(os.homedir(), ".openclaw", "dashboard.db");
+const db = new Database(DB_PATH, { readonly: true });
 
 async function ghExec(command, timeoutMs = 15000) {
   try {
