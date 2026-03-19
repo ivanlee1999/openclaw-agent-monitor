@@ -908,7 +908,8 @@ async function triggerBackgroundRefresh() {
 async function triggerNotificationRefresh() {
   console.log("[bg-notif] Refreshing notifications...");
   try {
-    const openPRs = db.prepare("SELECT owner, repo, number, title FROM prs WHERE state = 'open'").all();
+    // Include open PRs + recently merged/closed (last 24h) so we don't miss comments on fast-merged PRs
+    const openPRs = db.prepare("SELECT owner, repo, number, title FROM prs WHERE state = 'open' OR (state IN ('merged','closed') AND fetched_at > ?)").all(Date.now() - 86400000);
     console.log("[bg-notif] Checking", openPRs.length, "open PRs for comments");
     
     const insertStmt = db.prepare(`INSERT OR IGNORE INTO notifications 
