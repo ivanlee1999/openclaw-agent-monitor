@@ -903,6 +903,47 @@ async function triggerBackgroundRefresh() {
 }
 
 
+
+// Background notification refresh: fetch comments for open PRs and populate SQLite
+async function triggerNotificationRefresh() {
+  console.log("[bg-notif] Refreshing notifications...");
+  try {
+    const openPRs = db.prepare("SELECT owner, repo, number, title FROM prs WHERE state = 'open'").all();
+    console.log("[bg-notif] Checking", openPRs.length, "open PRs for comments");
+    
+    const insertStmt = db.prepare(`INSERT OR IGNORE INTO notifications 
+      (id, type, pr_url, pr_owner, pr_repo, pr_number, pr_title, user, body, path, line, diff_hunk, state, priority, created_at, read, fetched_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`);
+    
+    let inserted = 0;
+    for (const pr of openPRs) {
+      try {
+        const comments = await fetchPRCommentsViaGh(pr.owner, pr.repo, pr.number, pr.title);
+        const now = Date.now();
+        for (const c of comments) {
+          const prUrl = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.number}`;
+          const result = insertStmt.run(
+            String(c.id), c.type, prUrl, pr.owner, pr.repo, pr.number, pr.title || "",
+            c.user || "", c.body || "", c.path || null, c.line || null, 
+            c.diffHunk || null, c.state || null, c.priority || "low",
+            c.createdAt || "", now
+          );
+          if (result.changes > 0) inserted++;
+        }
+      } catch (err) {
+        console.error("[bg-notif] Error for", pr.owner + "/" + pr.repo + "#" + pr.number, err.message);
+      }
+    }
+    console.log("[bg-notif] Done. Inserted", inserted, "new notifications");
+  } catch (err) {
+    console.error("[bg-notif] Refresh error:", err.message);
+  }
+}
+
+// Run notification refresh 30s after startup (after PR refresh), then every 5 minutes
+setTimeout(() => triggerNotificationRefresh().catch(console.error), 30000);
+setInterval(() => triggerNotificationRefresh().catch(console.error), 300000);
+
 // --- Frontend ---
 
 const HTML = `<!DOCTYPE html>
