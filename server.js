@@ -417,7 +417,7 @@ const PR_LIST_STALE_TTL = 600000; // serve stale for 10 minutes while refreshing
 
 const prJsonlCache = new Map(); // key: jsonlPath -> { mtimeMs, prs: [{url, sessionId, sessionName}] }
 const prGhCache = new Map(); // key: prUrl -> { fetchedAt, data }
-const PR_GH_CACHE_TTL = 300000; // 5 minutes
+const PR_GH_CACHE_TTL = 1800000; // 30 minutes
 const PR_URL_RE = /https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/g;
 
 function getAllJsonlPaths() {
@@ -873,13 +873,19 @@ app.post("/api/notifications/refresh", async (_req, res) => {
 async function triggerBackgroundRefresh() {
   console.log("[bg] Refreshing PRs...");
   try {
-    const prs = getAllPRsFromJsonls();
+    const allPrs = getAllPRsFromJsonls();
+    // Only refresh PRs that are open or not yet in DB (skip closed/merged to save API calls)
+    const prs = allPrs.filter(pr => {
+      const row = db.prepare("SELECT state FROM prs WHERE url = ?").get(pr.url);
+      return !row || row.state === 'open';
+    });
+    console.log("[bg] Filtering: " + allPrs.length + " total, " + prs.length + " open/new to refresh");
     for (const pr of prs) {
       // Check if PR already in DB
       const existing = db.prepare("SELECT url, fetched_at, discovered_at FROM prs WHERE url = ?").get(pr.url);
       const now = Date.now();
       // Skip if fetched recently (within 5 min)
-      if (existing && (now - existing.fetched_at) < 300000) continue;
+      if (existing && (now - existing.fetched_at) < 1800000) continue; // 30 min cache
 
       // Fetch from GitHub
       try {
@@ -956,11 +962,11 @@ async function triggerNotificationRefresh() {
 
 // Run PR refresh every 5 minutes + on startup
 setTimeout(() => triggerBackgroundRefresh().catch(console.error), 5000);
-setInterval(() => triggerBackgroundRefresh().catch(console.error), 300000);
+setInterval(() => triggerBackgroundRefresh().catch(console.error), 900000); // 15 min
 
 // Run notification refresh 30s after startup (after PR refresh), then every 2 minutes
 setTimeout(() => triggerNotificationRefresh().catch(console.error), 30000);
-setInterval(() => triggerNotificationRefresh().catch(console.error), 120000);
+setInterval(() => triggerNotificationRefresh().catch(console.error), 600000); // 10 min
 
 // --- Settings API ---
 const OPENCLAW_CONFIG_PATH = path.join(os.homedir(), ".openclaw", "openclaw.json");
