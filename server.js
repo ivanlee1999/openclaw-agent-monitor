@@ -962,6 +962,220 @@ setInterval(() => triggerBackgroundRefresh().catch(console.error), 300000);
 setTimeout(() => triggerNotificationRefresh().catch(console.error), 30000);
 setInterval(() => triggerNotificationRefresh().catch(console.error), 120000);
 
+// --- Settings API ---
+const OPENCLAW_CONFIG_PATH = path.join(os.homedir(), ".openclaw", "openclaw.json");
+const PLUGIN_PACKAGE_PATH = path.join(os.homedir(), ".openclaw", "extensions", "openclaw-code-agent", "package.json");
+const PLUGIN_SCHEMA_PATH = path.join(os.homedir(), ".openclaw", "extensions", "openclaw-code-agent", "openclaw.plugin.json");
+const CREDENTIALS_PATH = path.join(os.homedir(), ".claude", ".credentials.json");
+const REFRESH_TOKEN_SCRIPT = path.join(os.homedir(), ".openclaw", "workspace", "scripts", "refresh-claude-token.sh");
+
+function readOpenclawConfig() {
+  const raw = fs.readFileSync(OPENCLAW_CONFIG_PATH, "utf-8");
+  return JSON.parse(raw);
+}
+
+function writeOpenclawConfig(config) {
+  fs.writeFileSync(OPENCLAW_CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf-8");
+}
+
+function getPluginConfig() {
+  const config = readOpenclawConfig();
+  const pluginEntry = config.plugins?.entries?.["openclaw-code-agent"] || {};
+  const pluginInstall = config.plugins?.installs?.["openclaw-code-agent"] || {};
+  const envVars = config.env?.vars || {};
+
+  // Read plugin schema for defaults
+  let schema = {};
+  try {
+    schema = JSON.parse(fs.readFileSync(PLUGIN_SCHEMA_PATH, "utf-8"));
+  } catch {}
+
+  // Read plugin package.json for version
+  let pluginVersion = pluginInstall.version || "unknown";
+  try {
+    const pkg = JSON.parse(fs.readFileSync(PLUGIN_PACKAGE_PATH, "utf-8"));
+    pluginVersion = pkg.version || pluginVersion;
+  } catch {}
+
+  // Detect Claude Code CLI path
+  let claudeCliPath = "";
+  try {
+    claudeCliPath = execSync("which claude 2>/dev/null || echo ''", { encoding: "utf-8" }).trim();
+  } catch {}
+
+  // Read SDK version from node_modules
+  let sdkVersion = "";
+  try {
+    const sdkPkgPath = path.join(os.homedir(), ".openclaw", "extensions", "openclaw-code-agent", "node_modules", "@anthropic-ai", "claude-code-agent-sdk", "package.json");
+    const sdkPkg = JSON.parse(fs.readFileSync(sdkPkgPath, "utf-8"));
+    sdkVersion = sdkPkg.version || "";
+  } catch {
+    // Try alternate location
+    try {
+      const sdkPkgPath2 = path.join(os.homedir(), ".openclaw", "node_modules", "@anthropic-ai", "claude-code-agent-sdk", "package.json");
+      const sdkPkg2 = JSON.parse(fs.readFileSync(sdkPkgPath2, "utf-8"));
+      sdkVersion = sdkPkg2.version || "";
+    } catch {}
+  }
+
+  // Read token expiry from credentials
+  let tokenExpiry = null;
+  let tokenExpired = false;
+  try {
+    const credRaw = fs.readFileSync(CREDENTIALS_PATH, "utf-8");
+    const cred = JSON.parse(credRaw);
+    if (cred.claudeAiOauth && cred.claudeAiOauth.expiresAt) {
+      tokenExpiry = cred.claudeAiOauth.expiresAt;
+      tokenExpired = Date.now() > cred.claudeAiOauth.expiresAt;
+    }
+  } catch {}
+
+  // Extract the actual plugin config values (merging entry.config if exists)
+  const pluginCfg = pluginEntry.config || {};
+
+  return {
+    // Plugin metadata
+    _meta: {
+      pluginVersion,
+      sdkVersion,
+      claudeCliPath,
+      sessionsFilePath: SESSIONS_FILE,
+      configFilePath: OPENCLAW_CONFIG_PATH,
+      schemaVersion: schema.version || "",
+      pluginEnabled: pluginEntry.enabled !== false,
+    },
+    // Agent defaults
+    permissionMode: pluginCfg.permissionMode || "plan",
+    defaultHarness: pluginCfg.defaultHarness || "claude-code",
+    defaultWorkdir: pluginCfg.defaultWorkdir || "",
+    maxSessions: pluginCfg.maxSessions ?? 20,
+    idleTimeoutMinutes: pluginCfg.idleTimeoutMinutes ?? 15,
+    sessionGcAgeMinutes: pluginCfg.sessionGcAgeMinutes ?? 1440,
+    maxPersistedSessions: pluginCfg.maxPersistedSessions ?? 10000,
+    maxAutoResponds: pluginCfg.maxAutoResponds ?? 10,
+    planApproval: pluginCfg.planApproval || "delegate",
+    // Harnesses
+    harnesses: pluginCfg.harnesses || {
+      "claude-code": { defaultModel: "sonnet", allowedModels: ["sonnet", "opus"] },
+      "codex": { defaultModel: "gpt-5.4", allowedModels: ["gpt-5.4"], reasoningEffort: "medium", approvalPolicy: "on-request" }
+    },
+    // Notifications
+    fallbackChannel: pluginCfg.fallbackChannel || "",
+    agentChannels: pluginCfg.agentChannels || {},
+    // Auth
+    claudeCodeOauthToken: envVars.CLAUDE_CODE_OAUTH_TOKEN ? "***SET***" : "",
+    hasOauthToken: !!envVars.CLAUDE_CODE_OAUTH_TOKEN,
+    tokenExpiry,
+    tokenExpired,
+  };
+}
+
+app.get("/api/settings", (_req, res) => {
+  try {
+    const settings = getPluginConfig();
+    res.json(settings);
+  } catch (err) {
+    console.error("Error reading settings:", err.message);
+    res.status(500).json({ error: "Failed to read settings: " + err.message });
+  }
+});
+
+app.post("/api/settings", (req, res) => {
+  try {
+    const updates = req.body;
+    const config = readOpenclawConfig();
+
+    // Ensure plugin entry exists
+    if (!config.plugins) config.plugins = {};
+    if (!config.plugins.entries) config.plugins.entries = {};
+    if (!config.plugins.entries["openclaw-code-agent"]) {
+      config.plugins.entries["openclaw-code-agent"] = { enabled: true };
+    }
+    const entry = config.plugins.entries["openclaw-code-agent"];
+    if (!entry.config) entry.config = {};
+    const cfg = entry.config;
+
+    // Update plugin config fields
+    if (updates.permissionMode !== undefined) cfg.permissionMode = updates.permissionMode;
+    if (updates.defaultHarness !== undefined) cfg.defaultHarness = updates.defaultHarness;
+    if (updates.defaultWorkdir !== undefined) {
+      if (updates.defaultWorkdir) cfg.defaultWorkdir = updates.defaultWorkdir;
+      else delete cfg.defaultWorkdir;
+    }
+    if (updates.maxSessions !== undefined) cfg.maxSessions = parseInt(updates.maxSessions) || 20;
+    if (updates.idleTimeoutMinutes !== undefined) cfg.idleTimeoutMinutes = parseInt(updates.idleTimeoutMinutes) || 15;
+    if (updates.sessionGcAgeMinutes !== undefined) cfg.sessionGcAgeMinutes = parseInt(updates.sessionGcAgeMinutes) || 1440;
+    if (updates.maxPersistedSessions !== undefined) cfg.maxPersistedSessions = parseInt(updates.maxPersistedSessions) || 10000;
+    if (updates.maxAutoResponds !== undefined) cfg.maxAutoResponds = parseInt(updates.maxAutoResponds) || 10;
+    if (updates.planApproval !== undefined) cfg.planApproval = updates.planApproval;
+    if (updates.harnesses !== undefined) cfg.harnesses = updates.harnesses;
+    if (updates.fallbackChannel !== undefined) {
+      if (updates.fallbackChannel) cfg.fallbackChannel = updates.fallbackChannel;
+      else delete cfg.fallbackChannel;
+    }
+    if (updates.agentChannels !== undefined) cfg.agentChannels = updates.agentChannels;
+
+    // Update OAuth token in env.vars (only if explicitly provided and not the masked value)
+    if (updates.claudeCodeOauthToken !== undefined && updates.claudeCodeOauthToken !== "***SET***") {
+      if (!config.env) config.env = {};
+      if (!config.env.vars) config.env.vars = {};
+      if (updates.claudeCodeOauthToken) {
+        config.env.vars.CLAUDE_CODE_OAUTH_TOKEN = updates.claudeCodeOauthToken;
+      } else {
+        delete config.env.vars.CLAUDE_CODE_OAUTH_TOKEN;
+      }
+    }
+
+    writeOpenclawConfig(config);
+
+    // Optionally restart gateway
+    const restart = updates._restart === true;
+    let restartResult = null;
+    if (restart) {
+      try {
+        execSync("openclaw restart 2>&1 || true", { encoding: "utf-8", timeout: 10000 });
+        restartResult = "Gateway restart triggered";
+      } catch (err) {
+        restartResult = "Gateway restart failed: " + (err.message || "unknown error");
+      }
+    }
+
+    res.json({ success: true, restart: restartResult });
+  } catch (err) {
+    console.error("Error saving settings:", err.message);
+    res.status(500).json({ error: "Failed to save settings: " + err.message });
+  }
+});
+
+app.post("/api/settings/refresh-token", async (_req, res) => {
+  try {
+    if (!fs.existsSync(REFRESH_TOKEN_SCRIPT)) {
+      return res.status(404).json({ error: "Refresh token script not found at " + REFRESH_TOKEN_SCRIPT });
+    }
+    const { stdout, stderr } = await execPromise("bash " + JSON.stringify(REFRESH_TOKEN_SCRIPT) + " 2>&1", {
+      encoding: "utf-8",
+      timeout: 30000,
+    });
+    const output = (stdout || "") + (stderr || "");
+
+    // Re-read credentials to check new expiry
+    let newExpiry = null;
+    let newExpired = false;
+    try {
+      const credRaw = fs.readFileSync(CREDENTIALS_PATH, "utf-8");
+      const cred = JSON.parse(credRaw);
+      if (cred.claudeAiOauth && cred.claudeAiOauth.expiresAt) {
+        newExpiry = cred.claudeAiOauth.expiresAt;
+        newExpired = Date.now() > cred.claudeAiOauth.expiresAt;
+      }
+    } catch {}
+
+    res.json({ success: true, output: output.trim(), tokenExpiry: newExpiry, tokenExpired: newExpired });
+  } catch (err) {
+    res.status(500).json({ error: "Token refresh failed: " + (err.message || "unknown error") });
+  }
+});
+
 // --- Frontend ---
 
 const HTML = `<!DOCTYPE html>
@@ -1718,6 +1932,174 @@ a:hover { text-decoration: underline; }
 .pr-comments-loading {
   font-size: 12px; color: var(--text-muted); font-style: italic; padding: 8px 0;
 }
+
+/* Settings view */
+.settings-view { display: none; }
+.settings-view.active { display: block; }
+
+.settings-sections {
+  display: flex; flex-direction: column; gap: 20px; max-width: 800px;
+}
+.settings-section {
+  background: var(--card-bg); border: 1px solid var(--border); border-radius: 2px;
+  overflow: hidden;
+}
+.settings-section-header {
+  padding: 14px 20px; font-size: 14px; font-weight: 600; color: var(--text-heading);
+  border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px;
+  background: var(--navbar);
+}
+.settings-section-body { padding: 16px 20px; display: flex; flex-direction: column; gap: 14px; }
+
+.settings-field { display: flex; flex-direction: column; gap: 4px; }
+.settings-field-row { display: flex; align-items: center; gap: 12px; }
+.settings-label {
+  font-size: 13px; font-weight: 500; color: var(--text-primary);
+  display: flex; align-items: center; gap: 6px;
+}
+.settings-hint { font-size: 11px; color: var(--text-muted); line-height: 1.4; }
+
+.settings-input, .settings-select {
+  background: var(--bg); border: 1px solid var(--border); color: var(--text-primary);
+  padding: 7px 12px; border-radius: 2px; font-size: 13px;
+  font-family: 'Inter', system-ui, sans-serif; outline: none;
+  transition: border-color 0.15s; width: 100%; max-width: 400px;
+}
+.settings-input:focus, .settings-select:focus { border-color: var(--accent); }
+.settings-input::placeholder { color: var(--text-muted); }
+.settings-input[type="number"] { max-width: 120px; }
+.settings-input.mono { font-family: var(--mono); font-size: 12px; }
+.settings-input.readonly {
+  background: var(--surface); color: var(--text-secondary); cursor: default;
+}
+
+.settings-select {
+  cursor: pointer; max-width: 280px; appearance: auto;
+}
+
+.settings-toggle {
+  position: relative; width: 40px; height: 22px; flex-shrink: 0;
+}
+.settings-toggle input { opacity: 0; width: 0; height: 0; position: absolute; }
+.settings-toggle-slider {
+  position: absolute; cursor: pointer; inset: 0;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 11px;
+  transition: background 0.2s, border-color 0.2s;
+}
+.settings-toggle-slider::before {
+  content: ''; position: absolute; height: 16px; width: 16px;
+  left: 2px; bottom: 2px; background: var(--text-muted);
+  border-radius: 50%; transition: transform 0.2s, background 0.2s;
+}
+.settings-toggle input:checked + .settings-toggle-slider {
+  background: var(--accent); border-color: var(--accent);
+}
+.settings-toggle input:checked + .settings-toggle-slider::before {
+  transform: translateX(18px); background: var(--bg);
+}
+
+.settings-password-wrap {
+  position: relative; display: flex; align-items: center; gap: 8px; max-width: 400px;
+}
+.settings-password-wrap .settings-input { flex: 1; padding-right: 36px; }
+.settings-password-toggle {
+  position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+  background: none; border: none; color: var(--text-muted); cursor: pointer;
+  font-size: 14px; padding: 2px;
+}
+.settings-password-toggle:hover { color: var(--text-primary); }
+
+.settings-status-dot {
+  width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0;
+}
+.settings-status-dot.active { background: var(--completed); }
+.settings-status-dot.inactive { background: var(--failed); }
+
+.settings-readonly-value {
+  font-family: var(--mono); font-size: 12px; color: var(--text-secondary);
+  background: var(--surface); border: 1px solid var(--border); border-radius: 2px;
+  padding: 7px 12px; max-width: 400px; word-break: break-all;
+}
+
+.settings-actions {
+  display: flex; gap: 10px; margin-top: 8px; padding-top: 16px;
+  border-top: 1px solid var(--border); flex-wrap: wrap;
+}
+.settings-btn {
+  padding: 8px 20px; border-radius: 2px; font-size: 13px; font-weight: 600;
+  font-family: 'Inter', system-ui, sans-serif; cursor: pointer;
+  transition: all 0.15s; border: 1px solid transparent;
+}
+.settings-btn-primary {
+  background: var(--accent); color: var(--bg); border-color: var(--accent);
+}
+.settings-btn-primary:hover { opacity: 0.9; }
+.settings-btn-secondary {
+  background: var(--card-bg); color: var(--text-primary); border-color: var(--border);
+}
+.settings-btn-secondary:hover { border-color: var(--accent); }
+.settings-btn-danger {
+  background: rgba(243,139,168,0.12); color: var(--failed); border-color: var(--failed);
+}
+.settings-btn-danger:hover { background: rgba(243,139,168,0.2); }
+.settings-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Toast */
+.toast-container {
+  position: fixed; bottom: 20px; right: 20px; z-index: 1000;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.toast {
+  padding: 12px 20px; border-radius: 2px; font-size: 13px; font-weight: 500;
+  font-family: 'Inter', system-ui, sans-serif; color: var(--bg);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3); animation: toast-in 0.3s ease;
+  max-width: 400px;
+}
+.toast.success { background: var(--completed); }
+.toast.error { background: var(--failed); }
+.toast.info { background: var(--running); }
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Harness config */
+.harness-block {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 2px;
+  padding: 12px 16px; margin-bottom: 8px;
+}
+.harness-block-title {
+  font-size: 12px; font-weight: 600; color: var(--accent);
+  text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px;
+  font-family: var(--mono);
+}
+.harness-fields { display: flex; flex-direction: column; gap: 10px; }
+.harness-field { display: flex; align-items: center; gap: 10px; }
+.harness-field label {
+  font-size: 12px; color: var(--text-secondary); min-width: 120px; flex-shrink: 0;
+}
+.harness-field .settings-input, .harness-field .settings-select {
+  max-width: 200px; font-size: 12px; padding: 5px 10px;
+}
+
+/* Agent channels editor */
+.channels-list { display: flex; flex-direction: column; gap: 6px; }
+.channel-row {
+  display: flex; align-items: center; gap: 8px;
+}
+.channel-row .settings-input { max-width: 200px; font-size: 12px; }
+.channel-remove-btn {
+  background: none; border: none; color: var(--failed); cursor: pointer;
+  font-size: 16px; padding: 2px 6px; border-radius: 2px;
+}
+.channel-remove-btn:hover { background: rgba(243,139,168,0.12); }
+.channel-add-btn {
+  background: none; border: 1px solid var(--border); color: var(--text-secondary);
+  font-size: 12px; padding: 4px 12px; border-radius: 2px; cursor: pointer;
+  font-family: 'Inter', system-ui, sans-serif; font-weight: 500;
+  transition: border-color 0.15s;
+}
+.channel-add-btn:hover { border-color: var(--accent); color: var(--text-primary); }
 </style>
 </head>
 <body>
@@ -1747,6 +2129,7 @@ a:hover { text-decoration: underline; }
     <button class="main-tab active" id="tab-sessions" onclick="switchMainTab('sessions')">&#x1f4cb; Sessions <span class="tab-count" id="sessions-tab-count">0</span></button>
     <button class="main-tab" id="tab-prs" onclick="switchMainTab('prs')">&#x1f517; Pull Requests <span class="tab-count" id="prs-tab-count">0</span></button>
     <button class="main-tab" id="tab-notifications" onclick="switchMainTab('notifications')">&#x1f514; Notifications <span class="tab-count" id="notifications-tab-count">0</span></button>
+    <button class="main-tab" id="tab-settings" onclick="switchMainTab('settings')">&#x2699;&#xfe0f; Settings <span class="tab-count">6</span></button>
   </div>
 
   <div class="sessions-view" id="sessions-view">
@@ -1788,7 +2171,185 @@ a:hover { text-decoration: underline; }
     </div>
     <div id="notifications-list"></div>
   </div>
+
+  <div class="settings-view" id="settings-view">
+    <div class="settings-sections">
+
+      <!-- Agent Defaults -->
+      <div class="settings-section">
+        <div class="settings-section-header">&#x1f916; Agent Defaults</div>
+        <div class="settings-section-body">
+          <div class="settings-field">
+            <label class="settings-label">Default Harness</label>
+            <select class="settings-select" id="settings-defaultHarness">
+              <option value="claude-code">claude-code</option>
+              <option value="codex">codex</option>
+            </select>
+            <span class="settings-hint">Default agent harness when agent_launch omits the harness parameter</span>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Permission Mode</label>
+            <select class="settings-select" id="settings-permissionMode">
+              <option value="default">default</option>
+              <option value="plan">plan</option>
+              <option value="acceptEdits">acceptEdits</option>
+              <option value="bypassPermissions">bypassPermissions</option>
+            </select>
+            <span class="settings-hint">Default plugin orchestration mode for coding agent sessions</span>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Plan Approval</label>
+            <select class="settings-select" id="settings-planApproval">
+              <option value="delegate">delegate</option>
+              <option value="approve">approve</option>
+              <option value="ask">ask</option>
+            </select>
+            <span class="settings-hint">Plan approval behavior: delegate (orchestrator decides), approve (auto-approve), ask (always ask user)</span>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Default Working Directory</label>
+            <input type="text" class="settings-input mono" id="settings-defaultWorkdir" placeholder="/home/user/project" />
+            <span class="settings-hint">Base directory for new sessions when not provided in agent_launch</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Harness Configuration -->
+      <div class="settings-section">
+        <div class="settings-section-header">&#x2699;&#xfe0f; Harness Configuration</div>
+        <div class="settings-section-body" id="settings-harnesses-container">
+          <!-- Populated by JS -->
+        </div>
+      </div>
+
+      <!-- Session Limits -->
+      <div class="settings-section">
+        <div class="settings-section-header">&#x23f1;&#xfe0f; Session Limits</div>
+        <div class="settings-section-body">
+          <div class="settings-field">
+            <label class="settings-label">Max Concurrent Sessions</label>
+            <input type="number" class="settings-input" id="settings-maxSessions" min="1" max="100" />
+            <span class="settings-hint">Upper limit on concurrently running coding-agent sessions</span>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Idle Timeout (minutes)</label>
+            <input type="number" class="settings-input" id="settings-idleTimeoutMinutes" min="1" max="1440" />
+            <span class="settings-hint">Minutes a paused multi-turn session can remain idle before auto-kill</span>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Session GC Age (minutes)</label>
+            <input type="number" class="settings-input" id="settings-sessionGcAgeMinutes" min="60" max="43200" />
+            <span class="settings-hint">TTL in minutes before terminal sessions are evicted from memory (default: 1440 = 24h)</span>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Max Persisted Sessions</label>
+            <input type="number" class="settings-input" id="settings-maxPersistedSessions" min="10" max="100000" />
+            <span class="settings-hint">Maximum completed sessions kept in memory for resume/list</span>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Max Auto-Responds</label>
+            <input type="number" class="settings-input" id="settings-maxAutoResponds" min="1" max="100" />
+            <span class="settings-hint">Maximum consecutive auto-responds per session before requiring user input</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Authentication -->
+      <div class="settings-section">
+        <div class="settings-section-header">&#x1f510; Authentication</div>
+        <div class="settings-section-body">
+          <div class="settings-field">
+            <div class="settings-field-row">
+              <label class="settings-label">CLAUDE_CODE_OAUTH_TOKEN</label>
+              <span class="settings-status-dot" id="settings-token-status"></span>
+              <span id="settings-token-status-text" style="font-size:11px"></span>
+            </div>
+            <div class="settings-password-wrap">
+              <input type="password" class="settings-input mono" id="settings-oauthToken" placeholder="sk-ant-oat01-..." />
+              <button class="settings-password-toggle" onclick="togglePasswordVisibility('settings-oauthToken')" type="button">&#x1f441;</button>
+            </div>
+            <span class="settings-hint">OAuth token for Claude Code agent sessions. Leave unchanged to keep current value.</span>
+          </div>
+          <div class="settings-field">
+            <div class="settings-field-row">
+              <label class="settings-label">Token Expiry</label>
+              <span class="settings-status-dot" id="settings-token-expiry-dot"></span>
+              <span id="settings-token-expiry-text" style="font-size:12px;font-family:var(--mono)"></span>
+            </div>
+            <span class="settings-hint">Token expiration from ~/.claude/.credentials.json</span>
+          </div>
+          <div class="settings-field">
+            <div class="settings-field-row">
+              <button class="settings-btn settings-btn-secondary" id="settings-refresh-token-btn" onclick="refreshToken()">&#x1f504; Refresh Token</button>
+              <span id="settings-refresh-status" style="font-size:12px;color:var(--text-muted)"></span>
+            </div>
+            <span class="settings-hint">Runs refresh-claude-token.sh to obtain a fresh OAuth token</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Notifications -->
+      <div class="settings-section">
+        <div class="settings-section-header">&#x1f514; Notification Channels</div>
+        <div class="settings-section-body">
+          <div class="settings-field">
+            <label class="settings-label">Fallback Channel</label>
+            <input type="text" class="settings-input mono" id="settings-fallbackChannel" placeholder="telegram|my-bot|123456789" />
+            <span class="settings-hint">Default notification channel when no workspace-specific entry matches</span>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Workspace Agent Channels</label>
+            <span class="settings-hint">Map working directories to notification channels (longest-prefix match)</span>
+            <div class="channels-list" id="settings-agentChannels">
+              <!-- Populated by JS -->
+            </div>
+            <button class="channel-add-btn" onclick="addAgentChannel()">+ Add Channel Mapping</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Advanced / Read-only -->
+      <div class="settings-section">
+        <div class="settings-section-header">&#x1f9ea; Advanced Info</div>
+        <div class="settings-section-body">
+          <div class="settings-field">
+            <label class="settings-label">Plugin Version</label>
+            <div class="settings-readonly-value" id="settings-pluginVersion">—</div>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">SDK Version</label>
+            <div class="settings-readonly-value" id="settings-sdkVersion">—</div>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Claude Code CLI Path</label>
+            <div class="settings-readonly-value" id="settings-claudeCliPath">—</div>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Sessions File</label>
+            <div class="settings-readonly-value" id="settings-sessionsFilePath">—</div>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Config File</label>
+            <div class="settings-readonly-value" id="settings-configFilePath">—</div>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Plugin Enabled</label>
+            <div class="settings-readonly-value" id="settings-pluginEnabled">—</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Save buttons -->
+      <div class="settings-actions">
+        <button class="settings-btn settings-btn-primary" id="settings-save-btn" onclick="saveSettings(false)">&#x1f4be; Save</button>
+        <button class="settings-btn settings-btn-danger" id="settings-save-restart-btn" onclick="saveSettings(true)">&#x1f504; Save &amp; Restart Gateway</button>
+        <button class="settings-btn settings-btn-secondary" onclick="fetchSettings()">&#x21bb; Reload</button>
+      </div>
+    </div>
+  </div>
 </div>
+
+<div class="toast-container" id="toast-container"></div>
 
 <script>
 // --- Theme toggle ---
@@ -2406,14 +2967,19 @@ function switchMainTab(tab) {
   document.getElementById("tab-sessions").classList.toggle("active", tab === "sessions");
   document.getElementById("tab-prs").classList.toggle("active", tab === "prs");
   document.getElementById("tab-notifications").classList.toggle("active", tab === "notifications");
+  document.getElementById("tab-settings").classList.toggle("active", tab === "settings");
   document.getElementById("sessions-view").classList.toggle("hidden", tab !== "sessions");
   document.getElementById("prs-view").classList.toggle("active", tab === "prs");
   document.getElementById("notifications-view").classList.toggle("active", tab === "notifications");
+  document.getElementById("settings-view").classList.toggle("active", tab === "settings");
   if (tab === "prs" && prs.length === 0 && !prFetchInProgress) {
     fetchPRs();
   }
   if (tab === "notifications" && notifications.length === 0 && !notifFetchInProgress) {
     fetchNotifications();
+  }
+  if (tab === "settings" && !settingsLoaded) {
+    fetchSettings();
   }
 }
 
@@ -2422,6 +2988,7 @@ function initFromHash() {
   const hash = window.location.hash.replace("#", "") || "sessions";
   if (hash === "prs") switchMainTab("prs");
   else if (hash === "notifications") switchMainTab("notifications");
+  else if (hash === "settings") switchMainTab("settings");
   else switchMainTab("sessions");
 }
 
@@ -2761,6 +3328,311 @@ function toggleNotifDiff(idx) {
 setInterval(() => {
   if (mainTab === "notifications") fetchNotifications();
 }, 120000);
+
+// --- Settings Tab ---
+let settingsLoaded = false;
+let settingsData = {};
+
+function showToast(message, type) {
+  type = type || "info";
+  const container = document.getElementById("toast-container");
+  const toast = document.createElement("div");
+  toast.className = "toast " + type;
+  toast.textContent = message;
+  container.appendChild(toast);
+  setTimeout(function() { toast.style.opacity = "0"; toast.style.transition = "opacity 0.3s"; }, 3000);
+  setTimeout(function() { toast.remove(); }, 3400);
+}
+
+function togglePasswordVisibility(inputId) {
+  var input = document.getElementById(inputId);
+  if (!input) return;
+  input.type = input.type === "password" ? "text" : "password";
+}
+
+async function fetchSettings() {
+  try {
+    const res = await fetch("/api/settings");
+    if (!res.ok) throw new Error("Failed to fetch settings");
+    settingsData = await res.json();
+    settingsLoaded = true;
+    populateSettings(settingsData);
+  } catch (err) {
+    console.error("Failed to fetch settings:", err);
+    showToast("Failed to load settings: " + err.message, "error");
+  }
+}
+
+function populateSettings(s) {
+  // Agent defaults
+  setSelectValue("settings-defaultHarness", s.defaultHarness);
+  setSelectValue("settings-permissionMode", s.permissionMode);
+  setSelectValue("settings-planApproval", s.planApproval);
+  setInputValue("settings-defaultWorkdir", s.defaultWorkdir);
+
+  // Session limits
+  setInputValue("settings-maxSessions", s.maxSessions);
+  setInputValue("settings-idleTimeoutMinutes", s.idleTimeoutMinutes);
+  setInputValue("settings-sessionGcAgeMinutes", s.sessionGcAgeMinutes);
+  setInputValue("settings-maxPersistedSessions", s.maxPersistedSessions);
+  setInputValue("settings-maxAutoResponds", s.maxAutoResponds);
+
+  // Auth
+  var tokenInput = document.getElementById("settings-oauthToken");
+  if (tokenInput) {
+    tokenInput.value = s.hasOauthToken ? "***SET***" : "";
+    tokenInput.placeholder = s.hasOauthToken ? "(token is set — enter new value to change)" : "sk-ant-oat01-...";
+  }
+  var statusDot = document.getElementById("settings-token-status");
+  var statusText = document.getElementById("settings-token-status-text");
+  if (statusDot) {
+    statusDot.className = "settings-status-dot " + (s.hasOauthToken ? "active" : "inactive");
+  }
+  if (statusText) {
+    statusText.textContent = s.hasOauthToken ? "Token set" : "Not configured";
+    statusText.style.color = s.hasOauthToken ? "var(--completed)" : "var(--failed)";
+  }
+
+  // Notifications
+  setInputValue("settings-fallbackChannel", s.fallbackChannel);
+  renderAgentChannels(s.agentChannels || {});
+
+  // Harnesses
+  renderHarnessConfig(s.harnesses || {});
+
+  // Token expiry
+  var expiryDot = document.getElementById("settings-token-expiry-dot");
+  var expiryText = document.getElementById("settings-token-expiry-text");
+  if (expiryDot && expiryText) {
+    if (s.tokenExpiry) {
+      var expiryDate = new Date(s.tokenExpiry);
+      var now = Date.now();
+      var msLeft = s.tokenExpiry - now;
+      var daysLeft = Math.floor(msLeft / 86400000);
+      var hoursLeft = Math.floor((msLeft % 86400000) / 3600000);
+      if (s.tokenExpired) {
+        expiryDot.className = "settings-status-dot inactive";
+        expiryText.textContent = "Expired " + expiryDate.toLocaleString();
+        expiryText.style.color = "var(--failed)";
+      } else {
+        expiryDot.className = "settings-status-dot active";
+        expiryText.textContent = expiryDate.toLocaleString() + " (" + daysLeft + "d " + hoursLeft + "h remaining)";
+        expiryText.style.color = daysLeft < 3 ? "var(--killed)" : "var(--completed)";
+      }
+    } else {
+      expiryDot.className = "settings-status-dot inactive";
+      expiryText.textContent = "No credentials found";
+      expiryText.style.color = "var(--text-muted)";
+    }
+  }
+
+  // Advanced
+  setText("settings-pluginVersion", s._meta?.pluginVersion || "unknown");
+  setText("settings-sdkVersion", s._meta?.sdkVersion || "(not detected)");
+  setText("settings-claudeCliPath", s._meta?.claudeCliPath || "(not detected)");
+  setText("settings-sessionsFilePath", s._meta?.sessionsFilePath || "—");
+  setText("settings-configFilePath", s._meta?.configFilePath || "—");
+  setText("settings-pluginEnabled", s._meta?.pluginEnabled ? "\\u2705 Enabled" : "\\u274c Disabled");
+}
+
+function setSelectValue(id, value) {
+  var el = document.getElementById(id);
+  if (el) el.value = value || "";
+}
+function setInputValue(id, value) {
+  var el = document.getElementById(id);
+  if (el) el.value = value != null ? value : "";
+}
+function setText(id, text) {
+  var el = document.getElementById(id);
+  if (el) el.textContent = text;
+}
+
+function renderHarnessConfig(harnesses) {
+  var container = document.getElementById("settings-harnesses-container");
+  if (!container) return;
+  var html = "";
+  var names = Object.keys(harnesses);
+  if (names.length === 0) names = ["claude-code", "codex"];
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    var h = harnesses[name] || {};
+    html += '<div class="harness-block" data-harness="' + escHtml(name) + '">'
+      + '<div class="harness-block-title">' + escHtml(name) + '</div>'
+      + '<div class="harness-fields">'
+      + '<div class="harness-field">'
+      + '<label>Default Model</label>'
+      + '<input type="text" class="settings-input mono harness-defaultModel" value="' + escHtml(h.defaultModel || "") + '" placeholder="sonnet" />'
+      + '</div>'
+      + '<div class="harness-field">'
+      + '<label>Allowed Models</label>'
+      + '<input type="text" class="settings-input mono harness-allowedModels" value="' + escHtml((h.allowedModels || []).join(", ")) + '" placeholder="sonnet, opus" />'
+      + '</div>';
+    if (name === "codex" || h.reasoningEffort !== undefined) {
+      html += '<div class="harness-field">'
+        + '<label>Reasoning Effort</label>'
+        + '<select class="settings-select harness-reasoningEffort">'
+        + '<option value="">(not set)</option>'
+        + '<option value="low"' + (h.reasoningEffort === "low" ? " selected" : "") + '>low</option>'
+        + '<option value="medium"' + (h.reasoningEffort === "medium" ? " selected" : "") + '>medium</option>'
+        + '<option value="high"' + (h.reasoningEffort === "high" ? " selected" : "") + '>high</option>'
+        + '</select></div>';
+    }
+    if (name === "codex" || h.approvalPolicy !== undefined) {
+      html += '<div class="harness-field">'
+        + '<label>Approval Policy</label>'
+        + '<select class="settings-select harness-approvalPolicy">'
+        + '<option value="">(not set)</option>'
+        + '<option value="never"' + (h.approvalPolicy === "never" ? " selected" : "") + '>never</option>'
+        + '<option value="on-request"' + (h.approvalPolicy === "on-request" ? " selected" : "") + '>on-request</option>'
+        + '</select></div>';
+    }
+    html += '</div></div>';
+  }
+  container.innerHTML = html;
+}
+
+function renderAgentChannels(channels) {
+  var container = document.getElementById("settings-agentChannels");
+  if (!container) return;
+  var keys = Object.keys(channels);
+  var html = "";
+  for (var i = 0; i < keys.length; i++) {
+    html += '<div class="channel-row">'
+      + '<input type="text" class="settings-input mono channel-path" value="' + escHtml(keys[i]) + '" placeholder="/home/user/project" />'
+      + '<span style="color:var(--text-muted);font-size:12px">\\u2192</span>'
+      + '<input type="text" class="settings-input mono channel-value" value="' + escHtml(channels[keys[i]]) + '" placeholder="telegram|bot|123" />'
+      + '<button class="channel-remove-btn" onclick="this.parentElement.remove()" title="Remove">\\u00d7</button>'
+      + '</div>';
+  }
+  container.innerHTML = html;
+}
+
+function addAgentChannel() {
+  var container = document.getElementById("settings-agentChannels");
+  if (!container) return;
+  var row = document.createElement("div");
+  row.className = "channel-row";
+  row.innerHTML = '<input type="text" class="settings-input mono channel-path" value="" placeholder="/home/user/project" />'
+    + '<span style="color:var(--text-muted);font-size:12px">\\u2192</span>'
+    + '<input type="text" class="settings-input mono channel-value" value="" placeholder="telegram|bot|123" />'
+    + '<button class="channel-remove-btn" onclick="this.parentElement.remove()" title="Remove">\\u00d7</button>';
+  container.appendChild(row);
+}
+
+function collectSettings() {
+  var s = {};
+
+  // Agent defaults
+  s.defaultHarness = document.getElementById("settings-defaultHarness").value;
+  s.permissionMode = document.getElementById("settings-permissionMode").value;
+  s.planApproval = document.getElementById("settings-planApproval").value;
+  s.defaultWorkdir = document.getElementById("settings-defaultWorkdir").value.trim();
+
+  // Session limits
+  s.maxSessions = parseInt(document.getElementById("settings-maxSessions").value) || 20;
+  s.idleTimeoutMinutes = parseInt(document.getElementById("settings-idleTimeoutMinutes").value) || 15;
+  s.sessionGcAgeMinutes = parseInt(document.getElementById("settings-sessionGcAgeMinutes").value) || 1440;
+  s.maxPersistedSessions = parseInt(document.getElementById("settings-maxPersistedSessions").value) || 10000;
+  s.maxAutoResponds = parseInt(document.getElementById("settings-maxAutoResponds").value) || 10;
+
+  // Auth token
+  var tokenVal = document.getElementById("settings-oauthToken").value;
+  if (tokenVal && tokenVal !== "***SET***") {
+    s.claudeCodeOauthToken = tokenVal;
+  }
+
+  // Notifications
+  s.fallbackChannel = document.getElementById("settings-fallbackChannel").value.trim();
+
+  // Agent channels
+  var channelRows = document.querySelectorAll("#settings-agentChannels .channel-row");
+  var agentChannels = {};
+  channelRows.forEach(function(row) {
+    var p = row.querySelector(".channel-path").value.trim();
+    var v = row.querySelector(".channel-value").value.trim();
+    if (p && v) agentChannels[p] = v;
+  });
+  s.agentChannels = agentChannels;
+
+  // Harnesses
+  var harnessBlocks = document.querySelectorAll("#settings-harnesses-container .harness-block");
+  var harnesses = {};
+  harnessBlocks.forEach(function(block) {
+    var name = block.getAttribute("data-harness");
+    var h = {};
+    var dm = block.querySelector(".harness-defaultModel");
+    if (dm && dm.value.trim()) h.defaultModel = dm.value.trim();
+    var am = block.querySelector(".harness-allowedModels");
+    if (am && am.value.trim()) {
+      h.allowedModels = am.value.split(",").map(function(m) { return m.trim(); }).filter(Boolean);
+    }
+    var re = block.querySelector(".harness-reasoningEffort");
+    if (re && re.value) h.reasoningEffort = re.value;
+    var ap = block.querySelector(".harness-approvalPolicy");
+    if (ap && ap.value) h.approvalPolicy = ap.value;
+    harnesses[name] = h;
+  });
+  s.harnesses = harnesses;
+
+  return s;
+}
+
+async function saveSettings(restart) {
+  var saveBtn = document.getElementById("settings-save-btn");
+  var restartBtn = document.getElementById("settings-save-restart-btn");
+  if (saveBtn) saveBtn.disabled = true;
+  if (restartBtn) restartBtn.disabled = true;
+
+  try {
+    var payload = collectSettings();
+    if (restart) payload._restart = true;
+
+    var res = await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    var data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Save failed");
+
+    if (data.restart) {
+      showToast("Settings saved. " + data.restart, "success");
+    } else {
+      showToast("Settings saved successfully", "success");
+    }
+    // Reload settings
+    await fetchSettings();
+  } catch (err) {
+    showToast("Failed to save: " + err.message, "error");
+  } finally {
+    if (saveBtn) saveBtn.disabled = false;
+    if (restartBtn) restartBtn.disabled = false;
+  }
+}
+
+async function refreshToken() {
+  var btn = document.getElementById("settings-refresh-token-btn");
+  var status = document.getElementById("settings-refresh-status");
+  if (btn) btn.disabled = true;
+  if (status) { status.textContent = "Refreshing..."; status.style.color = "var(--text-muted)"; }
+
+  try {
+    var res = await fetch("/api/settings/refresh-token", { method: "POST" });
+    var data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Refresh failed");
+
+    showToast("Token refreshed successfully", "success");
+    if (status) { status.textContent = "Done"; status.style.color = "var(--completed)"; }
+    // Reload settings to pick up new expiry
+    await fetchSettings();
+  } catch (err) {
+    showToast("Token refresh failed: " + err.message, "error");
+    if (status) { status.textContent = "Failed"; status.style.color = "var(--failed)"; }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
 
 // Init
 document.addEventListener("DOMContentLoaded", function() {
