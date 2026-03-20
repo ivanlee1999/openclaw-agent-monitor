@@ -417,7 +417,7 @@ const PR_LIST_STALE_TTL = 600000; // serve stale for 10 minutes while refreshing
 
 const prJsonlCache = new Map(); // key: jsonlPath -> { mtimeMs, prs: [{url, sessionId, sessionName}] }
 const prGhCache = new Map(); // key: prUrl -> { fetchedAt, data }
-const PR_GH_CACHE_TTL = 1800000; // 30 minutes
+const PR_GH_CACHE_TTL = 300000; // 5 minutes
 const PR_URL_RE = /https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/g;
 
 function getAllJsonlPaths() {
@@ -885,7 +885,7 @@ async function triggerBackgroundRefresh() {
       const existing = db.prepare("SELECT url, fetched_at, discovered_at FROM prs WHERE url = ?").get(pr.url);
       const now = Date.now();
       // Skip if fetched recently (within 5 min)
-      if (existing && (now - existing.fetched_at) < 1800000) continue; // 30 min cache
+      if (existing && (now - existing.fetched_at) < 300000) continue; // 5 min cache
 
       // Fetch from GitHub
       try {
@@ -962,11 +962,11 @@ async function triggerNotificationRefresh() {
 
 // Run PR refresh every 5 minutes + on startup
 setTimeout(() => triggerBackgroundRefresh().catch(console.error), 5000);
-setInterval(() => triggerBackgroundRefresh().catch(console.error), 900000); // 15 min
+setInterval(() => triggerBackgroundRefresh().catch(console.error), 300000); // 5 min
 
 // Run notification refresh 30s after startup (after PR refresh), then every 2 minutes
 setTimeout(() => triggerNotificationRefresh().catch(console.error), 30000);
-setInterval(() => triggerNotificationRefresh().catch(console.error), 600000); // 10 min
+setInterval(() => triggerNotificationRefresh().catch(console.error), 120000); // 2 min
 
 // --- Settings API ---
 const OPENCLAW_CONFIG_PATH = path.join(os.homedir(), ".openclaw", "openclaw.json");
@@ -1179,6 +1179,47 @@ app.post("/api/settings/refresh-token", async (_req, res) => {
     res.json({ success: true, output: output.trim(), tokenExpiry: newExpiry, tokenExpired: newExpired });
   } catch (err) {
     res.status(500).json({ error: "Token refresh failed: " + (err.message || "unknown error") });
+  }
+});
+
+
+// Immediately fetch a specific PR by URL (called after agent creates a PR)
+app.post("/api/prs/fetch", express.json(), async (req, res) => {
+  const { url } = req.body;
+  if (!url) return res.status(400).json({ error: "url required" });
+  console.log("[api] Immediate PR fetch:", url);
+  try {
+    const ghData = await fetchPRDetailsViaGh(url);
+    if (!ghData) return res.status(404).json({ error: "PR not found on GitHub" });
+    
+    const match = url.match(/github\.com\/([^\/]+)\/([^\/]+)\/pull\/(\d+)/);
+    if (!match) return res.status(400).json({ error: "Invalid PR URL" });
+    const [, owner, repo, numStr] = match;
+    const number = parseInt(numStr);
+    const state = ghData.state === "MERGED" ? "merged" : ghData.state === "CLOSED" ? "closed" : "open";
+    const merged = ghData.state === "MERGED" ? 1 : 0;
+    const now = Date.now();
+    
+    const insertArgs = [
+      url, owner, repo, number,
+      ghData.title || "", state, merged, ghData.isDraft ? 1 : 0,
+      ghData.createdAt || "", ghData.updatedAt || "",
+      ghData.author?.login || "",
+      (Array.isArray(ghData.comments) ? ghData.comments.length : (ghData.comments || 0)),
+      (Array.isArray(ghData.reviews) ? ghData.reviews.length : (ghData.reviews?.length || 0)),
+      "unknown", JSON.stringify(ghData.labels?.map(l => l.name) || []),
+      ghData.mergeable === "MERGEABLE" ? 1 : 0,
+      ghData.body || "",
+      req.body.sessionName || "", req.body.sessionId || "", now, now
+    ];
+    db.prepare(`INSERT OR REPLACE INTO prs (url, owner, repo, number, title, state, merged, draft, created_at, updated_at, author, review_comments, reviews, checks, labels, mergeable, body, session_name, session_id, fetched_at, discovered_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(...insertArgs);
+    
+    console.log("[api] PR", url, "fetched and stored");
+    res.json({ ok: true, title: ghData.title, state });
+  } catch (err) {
+    console.error("[api] PR fetch error:", err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
