@@ -1069,8 +1069,8 @@ function getPluginConfig() {
     fallbackChannel: pluginCfg.fallbackChannel || "",
     agentChannels: pluginCfg.agentChannels || {},
     // Auth
-    claudeCodeOauthToken: envVars.CLAUDE_CODE_OAUTH_TOKEN ? "***SET***" : "",
-    hasOauthToken: !!envVars.CLAUDE_CODE_OAUTH_TOKEN,
+    claudeCodeOauthToken: "Managed by harness (auto-refresh)",
+    hasOauthToken: true,
     tokenExpiry,
     tokenExpired,
   };
