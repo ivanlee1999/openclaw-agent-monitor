@@ -2,10 +2,10 @@ const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { execSync } = require("child_process");
-const { exec: execCb } = require("child_process");
+const { execFile, execSync } = require("child_process");
 const { promisify } = require("util");
-const execPromise = promisify(execCb);
+const execFileAsync = promisify(execFile);
+const JSON5 = require("json5");
 const Database = require("better-sqlite3");
 
 const DB_PATH = path.join(os.homedir(), ".openclaw", "dashboard.db");
@@ -64,17 +64,13 @@ db.exec(`
 db.pragma('journal_mode = WAL');
 
 
-async function ghExec(command, timeoutMs = 15000) {
-  try {
-    const { stdout } = await execPromise(command, {
-      encoding: "utf-8",
-      timeout: timeoutMs,
-      maxBuffer: 10 * 1024 * 1024
-    });
-    return stdout;
-  } catch (err) {
-    throw err;
-  }
+async function ghExec(args, timeoutMs = 15000) {
+  const { stdout } = await execFileAsync("gh", args, {
+    encoding: "utf-8",
+    timeout: timeoutMs,
+    maxBuffer: 10 * 1024 * 1024
+  });
+  return stdout;
 }
 
 const app = express();
@@ -754,7 +750,7 @@ async function fetchPRDetailsViaGh(prUrl) {
   if (cached && (Date.now() - cached.fetchedAt) < PR_GH_CACHE_TTL) return cached.data;
 
   try {
-    const json = await ghExec(`gh pr view "${prUrl}" --json title,state,isDraft,createdAt,updatedAt,author,statusCheckRollup,labels,mergeable,reviews,comments,number,body`);
+    const json = await ghExec(['pr', 'view', prUrl, '--json', 'title,state,isDraft,createdAt,updatedAt,author,statusCheckRollup,labels,mergeable,reviews,comments,number,body']);
     const data = JSON.parse(json);
     prGhCache.set(prUrl, { fetchedAt: Date.now(), data });
     return data;
@@ -852,7 +848,7 @@ app.get("/api/prs/:owner/:repo/:number", async (req, res) => {
     // Fetch detailed info including review comments
     let ghData = null;
     try {
-      const json = await ghExec(`gh pr view "${url}" --json title,state,isDraft,createdAt,updatedAt,author,statusCheckRollup,labels,mergeable,reviews,comments,number,body`);
+      const json = await ghExec(['pr', 'view', url, '--json', 'title,state,isDraft,createdAt,updatedAt,author,statusCheckRollup,labels,mergeable,reviews,comments,number,body']);
       ghData = JSON.parse(json);
     } catch (err) {
       console.error("gh pr view failed for", url, err.message);
@@ -892,7 +888,7 @@ async function fetchPRCommentsViaGh(owner, repo, number, prTitle) {
 
   // 1. Review comments (inline code comments)
   try {
-    const raw = await ghExec(`gh api repos/${owner}/${repo}/pulls/${number}/comments --paginate`);
+    const raw = await ghExec(['api', `repos/${owner}/${repo}/pulls/${number}/comments`, '--paginate']);
     const comments = JSON.parse(raw);
     for (const c of comments) {
       notifications.push({
@@ -915,7 +911,7 @@ async function fetchPRCommentsViaGh(owner, repo, number, prTitle) {
 
   // 2. Reviews (approve/request changes/comment)
   try {
-    const raw = await ghExec(`gh api repos/${owner}/${repo}/pulls/${number}/reviews --paginate`);
+    const raw = await ghExec(['api', `repos/${owner}/${repo}/pulls/${number}/reviews`, '--paginate']);
     const reviews = JSON.parse(raw);
     for (const r of reviews) {
       // Skip empty PENDING reviews
@@ -940,7 +936,7 @@ async function fetchPRCommentsViaGh(owner, repo, number, prTitle) {
 
   // 3. Issue comments (general PR comments)
   try {
-    const raw = await ghExec(`gh api repos/${owner}/${repo}/issues/${number}/comments --paginate`);
+    const raw = await ghExec(['api', `repos/${owner}/${repo}/issues/${number}/comments`, '--paginate']);
     const comments = JSON.parse(raw);
     for (const c of comments) {
       notifications.push({
@@ -1170,11 +1166,28 @@ const REFRESH_TOKEN_SCRIPT = path.join(os.homedir(), ".openclaw", "workspace", "
 
 function readOpenclawConfig() {
   const raw = fs.readFileSync(OPENCLAW_CONFIG_PATH, "utf-8");
-  return JSON.parse(raw);
+  return JSON5.parse(raw);
 }
 
+// Mutex to prevent concurrent writes to openclaw.json
+let configWriteLock = Promise.resolve();
+
 function writeOpenclawConfig(config) {
-  fs.writeFileSync(OPENCLAW_CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf-8");
+  // Atomic write: write to temp file, then rename
+  const tmpPath = OPENCLAW_CONFIG_PATH + ".tmp." + process.pid + "." + Date.now();
+  fs.writeFileSync(tmpPath, JSON.stringify(config, null, 2) + "\n", "utf-8");
+  fs.renameSync(tmpPath, OPENCLAW_CONFIG_PATH);
+}
+
+async function writeOpenclawConfigSafe(config) {
+  // Serialized writes via simple mutex
+  configWriteLock = configWriteLock.then(() => {
+    writeOpenclawConfig(config);
+  }).catch(err => {
+    console.error("[config] Atomic write failed:", err.message);
+    throw err;
+  });
+  return configWriteLock;
 }
 
 function getPluginConfig() {
@@ -1279,7 +1292,7 @@ app.get("/api/settings", (_req, res) => {
   }
 });
 
-app.post("/api/settings", (req, res) => {
+app.post("/api/settings", async (req, res) => {
   try {
     const updates = req.body;
     const config = readOpenclawConfig();
@@ -1325,14 +1338,14 @@ app.post("/api/settings", (req, res) => {
       }
     }
 
-    writeOpenclawConfig(config);
+    await writeOpenclawConfigSafe(config);
 
     // Optionally restart gateway
     const restart = updates._restart === true;
     let restartResult = null;
     if (restart) {
       try {
-        execSync("openclaw restart 2>&1 || true", { encoding: "utf-8", timeout: 10000 });
+        await execFileAsync("openclaw", ["restart"], { encoding: "utf-8", timeout: 10000 });
         restartResult = "Gateway restart triggered";
       } catch (err) {
         restartResult = "Gateway restart failed: " + (err.message || "unknown error");
@@ -1351,7 +1364,7 @@ app.post("/api/settings/refresh-token", async (_req, res) => {
     if (!fs.existsSync(REFRESH_TOKEN_SCRIPT)) {
       return res.status(404).json({ error: "Refresh token script not found at " + REFRESH_TOKEN_SCRIPT });
     }
-    const { stdout, stderr } = await execPromise("bash " + JSON.stringify(REFRESH_TOKEN_SCRIPT) + " 2>&1", {
+    const { stdout, stderr } = await execFileAsync("bash", [REFRESH_TOKEN_SCRIPT], {
       encoding: "utf-8",
       timeout: 30000,
     });
@@ -1416,14 +1429,106 @@ app.post("/api/prs/fetch", express.json(), async (req, res) => {
   }
 });
 
+// --- PWA: Manifest, Service Worker, Icons ---
+
+const PWA_MANIFEST = JSON.stringify({
+  name: "OpenClaw Dashboard",
+  short_name: "Dashboard",
+  start_url: "/",
+  display: "standalone",
+  background_color: "#1e1e2e",
+  theme_color: "#cba6f7",
+  icons: [
+    { src: "/icon-192.png", sizes: "192x192", type: "image/png" },
+    { src: "/icon-512.png", sizes: "512x512", type: "image/png" }
+  ]
+});
+
+// Generate a simple dashboard/gear icon as SVG, then serve as PNG via inline SVG
+const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="SIZE" height="SIZE">
+  <rect width="512" height="512" rx="96" fill="#1e1e2e"/>
+  <g transform="translate(256,256)">
+    <circle cx="0" cy="0" r="60" fill="none" stroke="#cba6f7" stroke-width="24"/>
+    <g fill="#cba6f7">${[0,45,90,135,180,225,270,315].map(a =>
+      `<rect x="-14" y="-150" width="28" height="60" rx="10" transform="rotate(${a})"/>`
+    ).join('')}</g>
+  </g>
+  <text x="256" y="430" text-anchor="middle" font-family="system-ui,sans-serif" font-weight="700" font-size="96" fill="#cba6f7">OC</text>
+</svg>`;
+
+function makeIconSvg(size) {
+  return ICON_SVG.replace(/SIZE/g, String(size));
+}
+
+app.get("/manifest.json", (_req, res) => {
+  res.type("application/manifest+json").send(PWA_MANIFEST);
+});
+
+app.get("/icon-192.png", (_req, res) => {
+  // Serve SVG with PNG content type hint — browsers handle SVG icons in manifests
+  res.type("image/svg+xml").send(makeIconSvg(192));
+});
+
+app.get("/icon-512.png", (_req, res) => {
+  res.type("image/svg+xml").send(makeIconSvg(512));
+});
+
+const SERVICE_WORKER_JS = `
+// OpenClaw Dashboard Service Worker — offline shell + cache-first static
+const CACHE_NAME = 'openclaw-dash-v1';
+const SHELL_URLS = ['/', '/manifest.json'];
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME).then(cache => cache.addAll(SHELL_URLS))
+      .then(() => self.skipWaiting())
+  );
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then(keys =>
+      Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k)))
+    ).then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener('fetch', (event) => {
+  const url = new URL(event.request.url);
+  // API calls: network only
+  if (url.pathname.startsWith('/api/')) return;
+  // App shell & static: stale-while-revalidate
+  event.respondWith(
+    caches.open(CACHE_NAME).then(cache =>
+      cache.match(event.request).then(cached => {
+        const fetchPromise = fetch(event.request).then(response => {
+          if (response.ok) cache.put(event.request, response.clone());
+          return response;
+        }).catch(() => cached);
+        return cached || fetchPromise;
+      })
+    )
+  );
+});
+`;
+
+app.get("/sw.js", (_req, res) => {
+  res.type("application/javascript").send(SERVICE_WORKER_JS);
+});
+
 // --- Frontend ---
 
 const HTML = `<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#1e1e2e">
 <title>OpenClaw Dashboard</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon-192.png">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27><text y=%27.9em%27 font-size=%2790%27>🐾</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -2340,6 +2445,135 @@ a:hover { text-decoration: underline; }
   transition: border-color 0.15s;
 }
 .channel-add-btn:hover { border-color: var(--accent); color: var(--text-primary); }
+
+/* --- Mobile / iPhone optimization --- */
+
+/* Touch-friendly defaults */
+* { -webkit-tap-highlight-color: transparent; }
+button, a, .filter-btn, .main-tab, .session-card, .pr-card, .notif-card {
+  touch-action: manipulation;
+}
+
+/* Tablet breakpoint */
+@media (max-width: 1024px) {
+  .container { padding: 12px; }
+  .settings-sections { max-width: 100%; }
+  .settings-input, .settings-select { max-width: 100%; }
+  .settings-password-wrap { max-width: 100%; }
+}
+
+/* Phone breakpoint */
+@media (max-width: 768px) {
+  /* Tab bar: horizontal scroll on mobile, smaller font */
+  .main-tabs {
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .main-tabs::-webkit-scrollbar { display: none; }
+  .main-tab {
+    font-size: 13px;
+    padding: 8px 12px;
+    white-space: nowrap;
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+  }
+
+  /* Header compact */
+  .header {
+    padding: 0 12px;
+    height: auto;
+    min-height: 44px;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding-top: env(safe-area-inset-top);
+  }
+  .header h1 { font-size: 14px; }
+  .header-stats { font-size: 12px; gap: 12px; }
+
+  /* Filter bar — scrollable on mobile */
+  .filter-bar {
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .filter-bar::-webkit-scrollbar { display: none; }
+  .filter-btn {
+    white-space: nowrap;
+    font-size: 12px;
+    padding: 8px 12px;
+    min-height: 44px;
+  }
+
+  /* Search input wider on mobile */
+  .search-input {
+    width: 100%;
+    max-width: 100%;
+    font-size: 16px; /* prevent iOS zoom on focus */
+  }
+
+  /* Session/PR cards: stack vertically, full width */
+  .cards-grid {
+    grid-template-columns: 1fr !important;
+    gap: 8px;
+  }
+  .session-card, .pr-card, .notif-card {
+    margin: 4px 0;
+    border-radius: 4px;
+  }
+
+  /* PR summary row: wrap */
+  .pr-summary { flex-wrap: wrap; gap: 8px; font-size: 12px; }
+
+  /* Settings: single column layout */
+  .settings-sections { max-width: 100%; }
+  .settings-field-row { flex-wrap: wrap; }
+  .settings-input, .settings-select { max-width: 100%; width: 100%; }
+  .settings-password-wrap { max-width: 100%; }
+  .settings-input[type="number"] { max-width: 100%; }
+  .settings-actions { flex-direction: column; }
+  .settings-btn { width: 100%; text-align: center; }
+  .harness-field { flex-wrap: wrap; }
+  .harness-field label { min-width: unset; width: 100%; }
+  .harness-field .settings-input, .harness-field .settings-select { max-width: 100%; }
+
+  /* Container padding */
+  .container { padding: 8px 8px; }
+
+  /* Bottom padding for iOS safe area */
+  body {
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+  }
+
+  /* Touch targets: minimum 44px */
+  .filter-btn, .main-tab, .settings-btn, .theme-toggle,
+  .output-actions button, .tl-show-more, .channel-add-btn,
+  .channel-remove-btn, .settings-password-toggle {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  /* Notification cards compact */
+  .notif-card { padding: 10px 12px; }
+
+  /* Timeline view compact */
+  .tl-card { margin: 6px 0; }
+  .tl-card-body { padding: 10px; max-height: 200px; }
+}
+
+/* Small phone */
+@media (max-width: 400px) {
+  .header h1 { font-size: 13px; }
+  .header .logo { font-size: 18px; }
+  .header-stats { display: none; }
+  .main-tab { font-size: 12px; padding: 6px 10px; }
+  .filter-btn { font-size: 11px; padding: 6px 8px; }
+}
 </style>
 </head>
 <body>
@@ -3881,6 +4115,10 @@ document.addEventListener("DOMContentLoaded", function() {
   // Fetch PR and notification counts after DOM is ready
   fetchPRs();
   fetchNotifications();
+  // Register service worker for PWA/offline support
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("/sw.js").catch(function() {});
+  }
 });
 </script>
 </body>
@@ -3890,6 +4128,12 @@ app.get("/", (_req, res) => {
   res.type("html").send(HTML);
 });
 
-app.listen(PORT, () => {
-  console.log("OpenClaw Dashboard running at http://localhost:" + PORT);
+// Bind to localhost by default; use --bind 0.0.0.0 to expose on all interfaces
+const BIND_HOST = (() => {
+  const idx = process.argv.indexOf('--bind');
+  return (idx !== -1 && process.argv[idx + 1]) ? process.argv[idx + 1] : '127.0.0.1';
+})();
+
+app.listen(PORT, BIND_HOST, () => {
+  console.log("OpenClaw Dashboard running at http://" + BIND_HOST + ":" + PORT);
 });
