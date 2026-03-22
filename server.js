@@ -1180,14 +1180,19 @@ function writeOpenclawConfig(config) {
 }
 
 async function writeOpenclawConfigSafe(config) {
-  // Serialized writes via simple mutex
-  configWriteLock = configWriteLock.then(() => {
-    writeOpenclawConfig(config);
-  }).catch(err => {
+  // Serialized writes via simple mutex — never poisons the chain on failure
+  const prev = configWriteLock;
+  let resolve;
+  configWriteLock = new Promise(r => resolve = r);
+  try {
+    await prev;
+    await writeOpenclawConfig(config);
+  } catch (err) {
     console.error("[config] Atomic write failed:", err.message);
     throw err;
-  });
-  return configWriteLock;
+  } finally {
+    resolve();
+  }
 }
 
 function getPluginConfig() {
@@ -1439,8 +1444,8 @@ const PWA_MANIFEST = JSON.stringify({
   background_color: "#1e1e2e",
   theme_color: "#cba6f7",
   icons: [
-    { src: "/icon-192.png", sizes: "192x192", type: "image/png" },
-    { src: "/icon-512.png", sizes: "512x512", type: "image/png" }
+    { src: "/icon-192.svg", sizes: "192x192", type: "image/svg+xml" },
+    { src: "/icon-512.svg", sizes: "512x512", type: "image/svg+xml" }
   ]
 });
 
@@ -1464,12 +1469,11 @@ app.get("/manifest.json", (_req, res) => {
   res.type("application/manifest+json").send(PWA_MANIFEST);
 });
 
-app.get("/icon-192.png", (_req, res) => {
-  // Serve SVG with PNG content type hint — browsers handle SVG icons in manifests
+app.get("/icon-192.svg", (_req, res) => {
   res.type("image/svg+xml").send(makeIconSvg(192));
 });
 
-app.get("/icon-512.png", (_req, res) => {
+app.get("/icon-512.svg", (_req, res) => {
   res.type("image/svg+xml").send(makeIconSvg(512));
 });
 
@@ -1497,6 +1501,19 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   // API calls: network only
   if (url.pathname.startsWith('/api/')) return;
+  // Navigation requests: network-first with offline fallback to cached shell
+  if (event.request.mode === 'navigate') {
+    event.respondWith(
+      fetch(event.request)
+        .then(response => {
+          const clone = response.clone();
+          caches.open(CACHE_NAME).then(cache => cache.put(event.request, clone));
+          return response;
+        })
+        .catch(() => caches.match('/'))
+    );
+    return;
+  }
   // App shell & static: stale-while-revalidate
   event.respondWith(
     caches.open(CACHE_NAME).then(cache =>
@@ -1528,7 +1545,7 @@ const HTML = `<!DOCTYPE html>
 <meta name="theme-color" content="#1e1e2e">
 <title>OpenClaw Dashboard</title>
 <link rel="manifest" href="/manifest.json">
-<link rel="apple-touch-icon" href="/icon-192.png">
+<link rel="apple-touch-icon" href="/icon-192.svg">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27><text y=%27.9em%27 font-size=%2790%27>🐾</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -2556,6 +2573,12 @@ button, a, .filter-btn, .main-tab, .session-card, .pr-card, .notif-card {
   .channel-remove-btn, .settings-password-toggle {
     min-height: 44px;
     min-width: 44px;
+  }
+  .notif-read-btn, .notif-pr-context a, .pr-github-link, .pr-card a {
+    min-height: 44px;
+    min-width: 44px;
+    display: inline-flex;
+    align-items: center;
   }
 
   /* Notification cards compact */
