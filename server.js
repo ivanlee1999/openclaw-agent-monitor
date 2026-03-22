@@ -101,18 +101,58 @@ function parseJsonlCached(jsonlPath) {
   return parsed;
 }
 
-function findJsonlPath(sessionId) {
-  let harnessSessionId = sessionId;
-  if (fs.existsSync(SESSIONS_FILE)) {
+function findCodexJsonlPath(harnessSessionId) {
+  const codexSessionsDir = path.join(os.homedir(), ".codex", "sessions");
+  if (!fs.existsSync(codexSessionsDir)) return null;
+  // Recursively search for a JSONL file whose name contains the harnessSessionId
+  function searchDir(dir) {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return null; }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        const found = searchDir(full);
+        if (found) return found;
+      } else if (entry.name.endsWith(".jsonl") && entry.name.includes(harnessSessionId)) {
+        return full;
+      }
+    }
+    return null;
+  }
+  return searchDir(codexSessionsDir);
+}
+
+function getSessionMeta(sessionId) {
+  if (!fs.existsSync(SESSIONS_FILE)) return { harnessSessionId: sessionId, harnessName: null };
+  try {
     const sessionsData = JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf-8"));
     const session = sessionsData.find(s => s.sessionId === sessionId);
-    if (session && session.harnessSessionId) {
-      harnessSessionId = session.harnessSessionId;
+    if (session) {
+      return {
+        harnessSessionId: session.harnessSessionId || sessionId,
+        harnessName: session.harnessName || null
+      };
     }
+  } catch {}
+  return { harnessSessionId: sessionId, harnessName: null };
+}
+
+function findJsonlPath(sessionId) {
+  const meta = getSessionMeta(sessionId);
+  const harnessSessionId = meta.harnessSessionId;
+
+  // If this is a Codex session, search the Codex sessions directory
+  if (meta.harnessName === "codex") {
+    const codexPath = findCodexJsonlPath(harnessSessionId);
+    if (codexPath) return codexPath;
   }
 
+  // Search Claude projects directory
   const claudeProjectsDir = path.join(os.homedir(), ".claude", "projects");
-  if (!fs.existsSync(claudeProjectsDir)) return null;
+  if (!fs.existsSync(claudeProjectsDir)) {
+    // Fall back to Codex search if Claude dir doesn't exist
+    return findCodexJsonlPath(harnessSessionId);
+  }
 
   const projectDirs = fs.readdirSync(claudeProjectsDir, { withFileTypes: true });
   for (const dir of projectDirs) {
@@ -120,7 +160,13 @@ function findJsonlPath(sessionId) {
     const candidate = path.join(claudeProjectsDir, dir.name, harnessSessionId + ".jsonl");
     if (fs.existsSync(candidate)) return candidate;
   }
-  return null;
+
+  // Fall back to Codex search if not found in Claude dir
+  return findCodexJsonlPath(harnessSessionId);
+}
+
+function isCodexJsonl(jsonlPath) {
+  return jsonlPath.includes(path.join(".codex", "sessions"));
 }
 
 
@@ -134,11 +180,19 @@ function extractModelFromJsonl(sessionId) {
   try {
     const data = fs.readFileSync(jsonlPath, "utf-8");
     const lines = data.split("\n");
+    const codex = isCodexJsonl(jsonlPath);
     for (const line of lines) {
       if (!line.trim()) continue;
       try {
         const obj = JSON.parse(line);
-        if (obj.type === "assistant" && obj.message && obj.message.model) {
+        // Codex: extract model from session_meta payload
+        if (codex && obj.type === "session_meta" && obj.payload && obj.payload.model) {
+          const model = obj.payload.model;
+          modelCache.set(sessionId, model);
+          return model;
+        }
+        // Claude: extract model from assistant message
+        if (!codex && obj.type === "assistant" && obj.message && obj.message.model) {
           const model = obj.message.model;
           modelCache.set(sessionId, model);
           return model;
@@ -219,6 +273,70 @@ function buildTimeline(entries, jsonlPath) {
         tool_use_id: entry.tool_use_id || "",
         timestamp: ts
       });
+    }
+  }
+  return timeline;
+}
+
+function buildCodexTimeline(entries, jsonlPath) {
+  const stat = fs.statSync(jsonlPath);
+  const fallbackTs = stat.mtime.toISOString();
+  const timeline = [];
+
+  for (const entry of entries) {
+    const ts = entry.timestamp || fallbackTs;
+
+    if (entry.type === "session_meta") {
+      // Session metadata — extract model and cwd info
+      const payload = entry.payload || {};
+      timeline.push({
+        type: "session_info",
+        content: `Model: ${payload.model || "unknown"}, CWD: ${payload.cwd || "unknown"}`,
+        timestamp: ts
+      });
+    } else if (entry.type === "response_item" && entry.payload) {
+      const p = entry.payload;
+
+      // User message (developer role with input_text)
+      if (p.type === "message" && p.role === "developer" && Array.isArray(p.content)) {
+        for (const block of p.content) {
+          if (block.type === "input_text" && block.text) {
+            timeline.push({ type: "prompt", content: block.text, timestamp: ts });
+          }
+        }
+      }
+
+      // Assistant message (assistant role with output_text)
+      if (p.type === "message" && p.role === "assistant" && Array.isArray(p.content)) {
+        for (const block of p.content) {
+          if (block.type === "output_text" && block.text) {
+            timeline.push({ type: "text", content: block.text, timestamp: ts });
+          }
+        }
+      }
+
+      // Tool use (function_call)
+      if (p.type === "function_call") {
+        let input = {};
+        try { input = JSON.parse(p.arguments || "{}"); } catch { input = { raw: p.arguments }; }
+        timeline.push({
+          type: "tool_call",
+          tool: p.name || "unknown",
+          input,
+          id: p.call_id || "",
+          timestamp: ts
+        });
+      }
+
+      // Tool result (function_call_output)
+      if (p.type === "function_call_output") {
+        timeline.push({
+          type: "tool_result",
+          content: typeof p.output === "string" ? p.output : JSON.stringify(p.output || ""),
+          tool_use_id: p.call_id || "",
+          timestamp: ts
+        });
+      }
     }
   }
   return timeline;
@@ -349,7 +467,9 @@ app.get("/api/sessions/:id/history", async (req, res) => {
     }
 
     const entries = parseJsonlCached(jsonlPath);
-    const timeline = buildTimeline(entries, jsonlPath);
+    const timeline = isCodexJsonl(jsonlPath)
+      ? buildCodexTimeline(entries, jsonlPath)
+      : buildTimeline(entries, jsonlPath);
     res.json(timeline);
   } catch (err) {
     console.error("Error reading session history:", err.message);
@@ -369,6 +489,15 @@ app.get("/api/sessions/:id/latest", async (req, res) => {
     }
 
     const allEntries = parseJsonlCached(jsonlPath);
+    const codex = isCodexJsonl(jsonlPath);
+
+    if (codex) {
+      // For Codex sessions, reuse buildCodexTimeline on the last few entries
+      const lastEntries = allEntries.slice(-10);
+      const timeline = buildCodexTimeline(lastEntries, jsonlPath);
+      return res.json(timeline.slice(-3));
+    }
+
     const stat = fs.statSync(jsonlPath);
     const fallbackTs = stat.mtime.toISOString();
 
@@ -421,20 +550,42 @@ const PR_GH_CACHE_TTL = 300000; // 5 minutes
 const PR_URL_RE = /https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/g;
 
 function getAllJsonlPaths() {
-  const claudeProjectsDir = path.join(os.homedir(), ".claude", "projects");
-  if (!fs.existsSync(claudeProjectsDir)) return [];
   const results = [];
-  try {
-    const projectDirs = fs.readdirSync(claudeProjectsDir, { withFileTypes: true });
-    for (const dir of projectDirs) {
-      if (!dir.isDirectory()) continue;
-      const dirPath = path.join(claudeProjectsDir, dir.name);
-      const files = fs.readdirSync(dirPath).filter(f => f.endsWith(".jsonl"));
-      for (const f of files) {
-        results.push(path.join(dirPath, f));
+
+  // Claude projects directory
+  const claudeProjectsDir = path.join(os.homedir(), ".claude", "projects");
+  if (fs.existsSync(claudeProjectsDir)) {
+    try {
+      const projectDirs = fs.readdirSync(claudeProjectsDir, { withFileTypes: true });
+      for (const dir of projectDirs) {
+        if (!dir.isDirectory()) continue;
+        const dirPath = path.join(claudeProjectsDir, dir.name);
+        const files = fs.readdirSync(dirPath).filter(f => f.endsWith(".jsonl"));
+        for (const f of files) {
+          results.push(path.join(dirPath, f));
+        }
+      }
+    } catch {}
+  }
+
+  // Codex sessions directory (recursive)
+  const codexSessionsDir = path.join(os.homedir(), ".codex", "sessions");
+  if (fs.existsSync(codexSessionsDir)) {
+    function collectCodexJsonls(dir) {
+      let entries;
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          collectCodexJsonls(full);
+        } else if (entry.name.endsWith(".jsonl")) {
+          results.push(full);
+        }
       }
     }
-  } catch {}
+    collectCodexJsonls(codexSessionsDir);
+  }
+
   return results;
 }
 
@@ -448,7 +599,16 @@ function extractPRsFromJsonl(jsonlPath) {
     const lines = raw.split("\n").filter(l => l.trim());
     const prs = [];
     const seenUrls = new Set();
-    const harnessSessionId = path.basename(jsonlPath, ".jsonl");
+    const codex = isCodexJsonl(jsonlPath);
+
+    // For Codex files, extract session ID from the filename (rollout-...-<uuid>.jsonl)
+    // For Claude files, use the basename without extension
+    let harnessSessionId = path.basename(jsonlPath, ".jsonl");
+    if (codex) {
+      // Extract the UUID portion from rollout-YYYY-MM-DDTHH-MM-SS-<uuid>.jsonl
+      const uuidMatch = harnessSessionId.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+      if (uuidMatch) harnessSessionId = uuidMatch[1];
+    }
 
     // Find session info
     let sessionName = "";
@@ -464,69 +624,102 @@ function extractPRsFromJsonl(jsonlPath) {
       } catch {}
     }
 
-    // Strategy 1: Look for gh pr create tool_use and corresponding tool_result
     const entries = [];
     for (const line of lines) {
       try { entries.push(JSON.parse(line)); } catch {}
     }
 
-    const ghPrCreateToolIds = new Set();
-    for (const entry of entries) {
-      if (entry.type === "assistant" && Array.isArray(entry.message?.content)) {
-        for (const block of entry.message.content) {
-          if (block.type === "tool_use" && block.name === "Bash" &&
-              typeof block.input?.command === "string" && block.input.command.includes("gh pr create")) {
-            if (block.id) ghPrCreateToolIds.add(block.id);
-          }
+    function addPrUrl(text) {
+      if (typeof text !== "string") return;
+      let match;
+      const re = new RegExp(PR_URL_RE.source, "g");
+      while ((match = re.exec(text)) !== null) {
+        if (!seenUrls.has(match[0])) {
+          seenUrls.add(match[0]);
+          prs.push({ url: match[0], owner: match[1], repo: match[2], number: parseInt(match[3]), sessionId, sessionName, harnessSessionId });
         }
       }
     }
 
-    // Find tool_results matching those tool_use ids
-    for (const entry of entries) {
-      if (entry.type === "user" && Array.isArray(entry.message?.content)) {
-        for (const block of entry.message.content) {
-          if (block.type === "tool_result" && ghPrCreateToolIds.has(block.tool_use_id)) {
-            const text = typeof block.content === "string" ? block.content :
-              Array.isArray(block.content) ? block.content.map(c => typeof c === "string" ? c : c.text || "").join("\n") : "";
-            let match;
-            const re = new RegExp(PR_URL_RE.source, "g");
-            while ((match = re.exec(text)) !== null) {
-              if (!seenUrls.has(match[0])) {
-                seenUrls.add(match[0]);
-                prs.push({ url: match[0], owner: match[1], repo: match[2], number: parseInt(match[3]), sessionId, sessionName, harnessSessionId });
+    if (codex) {
+      // Codex PR extraction
+      // Strategy 1: Find shell function_calls with gh pr create and their outputs
+      const ghPrCreateCallIds = new Set();
+      for (const entry of entries) {
+        if (entry.type === "response_item" && entry.payload) {
+          const p = entry.payload;
+          if (p.type === "function_call" && p.name === "shell") {
+            try {
+              const args = JSON.parse(p.arguments || "{}");
+              if (typeof args.command === "string" && args.command.includes("gh pr create")) {
+                if (p.call_id) ghPrCreateCallIds.add(p.call_id);
               }
+            } catch {}
+          }
+        }
+      }
+      for (const entry of entries) {
+        if (entry.type === "response_item" && entry.payload) {
+          const p = entry.payload;
+          if (p.type === "function_call_output" && ghPrCreateCallIds.has(p.call_id)) {
+            addPrUrl(typeof p.output === "string" ? p.output : JSON.stringify(p.output || ""));
+          }
+        }
+      }
+      // Strategy 2: Scan assistant output_text and function_call_output for PR URLs
+      for (const entry of entries) {
+        if (entry.type === "response_item" && entry.payload) {
+          const p = entry.payload;
+          if (p.type === "message" && p.role === "assistant" && Array.isArray(p.content)) {
+            for (const block of p.content) {
+              if (block.type === "output_text") addPrUrl(block.text);
+            }
+          }
+          if (p.type === "function_call_output") {
+            addPrUrl(typeof p.output === "string" ? p.output : JSON.stringify(p.output || ""));
+          }
+        }
+      }
+    } else {
+      // Claude PR extraction (existing logic)
+      // Strategy 1: Look for gh pr create tool_use and corresponding tool_result
+      const ghPrCreateToolIds = new Set();
+      for (const entry of entries) {
+        if (entry.type === "assistant" && Array.isArray(entry.message?.content)) {
+          for (const block of entry.message.content) {
+            if (block.type === "tool_use" && block.name === "Bash" &&
+                typeof block.input?.command === "string" && block.input.command.includes("gh pr create")) {
+              if (block.id) ghPrCreateToolIds.add(block.id);
             }
           }
         }
       }
-      // Also check top-level tool_result entries
-      if (entry.type === "tool_result" && ghPrCreateToolIds.has(entry.tool_use_id)) {
-        const text = typeof entry.content === "string" ? entry.content :
-          Array.isArray(entry.content) ? entry.content.map(c => typeof c === "string" ? c : c.text || "").join("\n") : "";
-        let match;
-        const re = new RegExp(PR_URL_RE.source, "g");
-        while ((match = re.exec(text)) !== null) {
-          if (!seenUrls.has(match[0])) {
-            seenUrls.add(match[0]);
-            prs.push({ url: match[0], owner: match[1], repo: match[2], number: parseInt(match[3]), sessionId, sessionName, harnessSessionId });
+
+      // Find tool_results matching those tool_use ids
+      for (const entry of entries) {
+        if (entry.type === "user" && Array.isArray(entry.message?.content)) {
+          for (const block of entry.message.content) {
+            if (block.type === "tool_result" && ghPrCreateToolIds.has(block.tool_use_id)) {
+              const text = typeof block.content === "string" ? block.content :
+                Array.isArray(block.content) ? block.content.map(c => typeof c === "string" ? c : c.text || "").join("\n") : "";
+              addPrUrl(text);
+            }
           }
         }
+        // Also check top-level tool_result entries
+        if (entry.type === "tool_result" && ghPrCreateToolIds.has(entry.tool_use_id)) {
+          const text = typeof entry.content === "string" ? entry.content :
+            Array.isArray(entry.content) ? entry.content.map(c => typeof c === "string" ? c : c.text || "").join("\n") : "";
+          addPrUrl(text);
+        }
       }
-    }
 
-    // Strategy 2: Fallback - scan assistant text blocks for PR URLs
-    for (const entry of entries) {
-      if (entry.type === "assistant" && Array.isArray(entry.message?.content)) {
-        for (const block of entry.message.content) {
-          if (block.type === "text" && typeof block.text === "string") {
-            let match;
-            const re = new RegExp(PR_URL_RE.source, "g");
-            while ((match = re.exec(block.text)) !== null) {
-              if (!seenUrls.has(match[0])) {
-                seenUrls.add(match[0]);
-                prs.push({ url: match[0], owner: match[1], repo: match[2], number: parseInt(match[3]), sessionId, sessionName, harnessSessionId });
-              }
+      // Strategy 2: Fallback - scan assistant text blocks for PR URLs
+      for (const entry of entries) {
+        if (entry.type === "assistant" && Array.isArray(entry.message?.content)) {
+          for (const block of entry.message.content) {
+            if (block.type === "text" && typeof block.text === "string") {
+              addPrUrl(block.text);
             }
           }
         }
@@ -928,7 +1121,7 @@ async function triggerNotificationRefresh() {
   console.log("[bg-notif] Refreshing notifications...");
   try {
     // Include open PRs + recently merged/closed (last 24h) so we don't miss comments on fast-merged PRs
-    const openPRs = db.prepare("SELECT owner, repo, number, title FROM prs WHERE state = 'open' OR (state IN ('merged','closed') AND fetched_at > ?)").all(Date.now() - 86400000);
+    const openPRs = db.prepare("SELECT owner, repo, number, title FROM prs WHERE state = 'open'").all();
     console.log("[bg-notif] Checking", openPRs.length, "open PRs for comments");
     
     const insertStmt = db.prepare(`INSERT OR IGNORE INTO notifications 
