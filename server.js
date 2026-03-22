@@ -2042,20 +2042,9 @@ a:hover { text-decoration: underline; }
 .empty-state h2 { font-size: 18px; color: var(--text-heading); margin-bottom: 6px; font-weight: 600; }
 .empty-state p { color: var(--text-secondary); font-size: 14px; }
 
-/* Responsive */
+/* Responsive — search wrap on mobile */
 @media (max-width: 768px) {
-  .header { padding: 0 12px; height: 44px; }
-  .header h1 { font-size: 14px; }
-  .header-stats { gap: 12px; font-size: 12px; }
-  .container { padding: 16px 12px; }
-  .card-header { padding: 16px 18px; grid-template-columns: 1fr; }
-  .session-name { max-width: 220px; font-size: 14px; }
-  .card-cost { justify-self: start; }
-  .card-meta { gap: 10px; }
-  .filter-btn { padding: 8px 12px; font-size: 12px; }
   .search-wrap { min-width: 140px; max-width: 100%; margin-left: 0; flex-basis: 100%; }
-  .cards-grid { gap: 16px; }
-  .card-preview { padding: 0 14px 10px 14px; }
 }
 
 /* Main view tabs */
@@ -2481,21 +2470,39 @@ button, a, .filter-btn, .main-tab, .session-card, .pr-card, .notif-card {
 
 /* Phone breakpoint */
 @media (max-width: 768px) {
-  /* Tab bar: horizontal scroll on mobile, smaller font */
+  /* --- Tab bar: emoji + badge only on mobile --- */
   .main-tabs {
     overflow-x: auto;
     flex-wrap: nowrap;
     -webkit-overflow-scrolling: touch;
     scrollbar-width: none;
+    justify-content: space-around;
   }
   .main-tabs::-webkit-scrollbar { display: none; }
   .main-tab {
-    font-size: 13px;
-    padding: 8px 12px;
+    position: relative;
+    padding: 10px 18px;
+    font-size: 20px;
     white-space: nowrap;
     min-height: 44px;
     display: inline-flex;
     align-items: center;
+    justify-content: center;
+  }
+  .main-tab .tab-label { display: none; }
+  .main-tab .tab-count {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    font-size: 10px;
+    font-weight: 700;
+    background: var(--accent);
+    color: var(--bg);
+    border-radius: 10px;
+    padding: 1px 5px;
+    min-width: 16px;
+    text-align: center;
+    line-height: 14px;
   }
 
   /* Header compact */
@@ -2532,7 +2539,7 @@ button, a, .filter-btn, .main-tab, .session-card, .pr-card, .notif-card {
     font-size: 16px; /* prevent iOS zoom on focus */
   }
 
-  /* Session/PR cards: stack vertically, full width */
+  /* --- Session cards mobile --- */
   .cards-grid {
     grid-template-columns: 1fr !important;
     gap: 8px;
@@ -2540,27 +2547,107 @@ button, a, .filter-btn, .main-tab, .session-card, .pr-card, .notif-card {
   .session-card, .pr-card, .notif-card {
     margin: 4px 0;
     border-radius: 4px;
+    width: 100%;
+    max-width: 100%;
   }
+  .card-header {
+    padding: 14px 14px;
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .card-top-row { flex-wrap: wrap; }
+  .session-name { max-width: 100%; font-size: 14px; white-space: normal; word-break: break-word; }
+  .card-meta {
+    gap: 6px 12px;
+    flex-wrap: wrap;
+    font-size: 11px;
+  }
+  .card-cost { justify-self: start; font-size: 13px; }
+  .card-prompt { padding: 0 14px 8px 14px !important; font-size: 12px; white-space: normal; word-break: break-word; }
+  .card-preview { padding: 0 14px 10px 14px; }
+
+  /* --- PR cards mobile --- */
+  .pr-card {
+    padding: 14px 14px;
+    width: 100%;
+  }
+  .pr-header-row { flex-wrap: wrap; gap: 6px; }
+  .pr-title {
+    font-size: 14px;
+    white-space: normal;
+    word-break: break-word;
+    line-height: 1.4;
+  }
+  .pr-meta-row {
+    gap: 6px 12px;
+    font-size: 11px;
+    flex-wrap: wrap;
+  }
+  .pr-meta-row span { white-space: normal; }
+  .pr-stats-row {
+    gap: 6px 12px;
+    font-size: 11px;
+    flex-wrap: wrap;
+  }
+  .pr-body-text { padding: 10px 12px; font-size: 12px; }
 
   /* PR summary row: wrap */
   .pr-summary { flex-wrap: wrap; gap: 8px; font-size: 12px; }
 
-  /* Settings: single column layout */
+  /* --- Notification cards mobile --- */
+  .notif-card {
+    padding: 12px 14px;
+    width: 100%;
+  }
+  .notif-header { flex-wrap: wrap; gap: 6px; }
+  .notif-user { font-size: 13px; }
+  .notif-time { font-size: 11px; margin-left: 0; }
+  .notif-body, .notif-body-code {
+    font-size: 12px;
+    word-break: break-word;
+    overflow-wrap: break-word;
+  }
+  .notif-pr-context { font-size: 11px; word-break: break-word; }
+  .notif-read-btn {
+    min-height: 44px;
+    min-width: 44px;
+    padding: 8px 12px;
+    font-size: 18px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* --- Settings mobile: single column, full width --- */
   .settings-sections { max-width: 100%; }
-  .settings-field-row { flex-wrap: wrap; }
-  .settings-input, .settings-select { max-width: 100%; width: 100%; }
-  .settings-password-wrap { max-width: 100%; }
+  .settings-section-header { padding: 12px 14px; font-size: 13px; }
+  .settings-section-body { padding: 14px 14px; gap: 16px; }
+  .settings-field { flex-direction: column; gap: 6px; }
+  .settings-field-row { flex-direction: column; align-items: stretch; gap: 8px; }
+  .settings-label { font-size: 13px; margin-bottom: 2px; }
+  .settings-input, .settings-select {
+    max-width: 100%;
+    width: 100%;
+    font-size: 16px; /* prevent iOS zoom */
+    padding: 10px 12px;
+  }
   .settings-input[type="number"] { max-width: 100%; }
-  .settings-actions { flex-direction: column; }
-  .settings-btn { width: 100%; text-align: center; }
+  .settings-password-wrap { max-width: 100%; flex-direction: row; }
+  .settings-actions { flex-direction: column; gap: 8px; }
+  .settings-btn { width: 100%; text-align: center; min-height: 44px; }
   .harness-field { flex-wrap: wrap; }
   .harness-field label { min-width: unset; width: 100%; }
   .harness-field .settings-input, .harness-field .settings-select { max-width: 100%; }
+  .settings-hint { font-size: 11px; }
 
   /* Container padding */
   .container { padding: 8px 8px; }
 
-  /* Bottom padding for iOS safe area */
+  /* --- General mobile: prevent horizontal scroll --- */
+  html, body {
+    overflow-x: hidden;
+    max-width: 100vw;
+  }
   body {
     padding-bottom: env(safe-area-inset-bottom);
     padding-left: env(safe-area-inset-left);
@@ -2574,28 +2661,47 @@ button, a, .filter-btn, .main-tab, .session-card, .pr-card, .notif-card {
     min-height: 44px;
     min-width: 44px;
   }
-  .notif-read-btn, .notif-pr-context a, .pr-github-link, .pr-card a {
+  .notif-pr-context a, .pr-github-link, .pr-card a {
     min-height: 44px;
     min-width: 44px;
     display: inline-flex;
     align-items: center;
   }
 
-  /* Notification cards compact */
-  .notif-card { padding: 10px 12px; }
-
   /* Timeline view compact */
   .tl-card { margin: 6px 0; }
-  .tl-card-body { padding: 10px; max-height: 200px; }
+  .tl-card-body { padding: 10px; max-height: 200px; font-size: 12px; }
+  .tl-card-header { font-size: 12px; padding: 8px 10px; }
+
+  /* PR/Notif filter bars on mobile */
+  .pr-filter-bar, .notif-filter-bar {
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .pr-filter-bar::-webkit-scrollbar, .notif-filter-bar::-webkit-scrollbar { display: none; }
+
+  /* Diff hunk compact */
+  .notif-diff-hunk { font-size: 10px; padding: 6px 8px; }
+
+  /* Channel rows on settings */
+  .channel-row { flex-wrap: wrap; }
+  .channel-row .settings-input { max-width: 100%; width: 100%; }
 }
 
-/* Small phone */
+/* Small phone (iPhone SE / 390px) */
 @media (max-width: 400px) {
   .header h1 { font-size: 13px; }
   .header .logo { font-size: 18px; }
   .header-stats { display: none; }
-  .main-tab { font-size: 12px; padding: 6px 10px; }
+  .main-tab { padding: 8px 14px; font-size: 18px; }
   .filter-btn { font-size: 11px; padding: 6px 8px; }
+  .card-header { padding: 12px 10px; }
+  .pr-card { padding: 12px 10px; }
+  .notif-card { padding: 10px 10px; }
+  .settings-section-body { padding: 12px 10px; }
+  .container { padding: 6px 6px; }
 }
 </style>
 </head>
@@ -2623,10 +2729,10 @@ button, a, .filter-btn, .main-tab, .session-card, .pr-card, .notif-card {
 
 <div class="container">
   <div class="main-tabs">
-    <button class="main-tab active" id="tab-sessions" onclick="switchMainTab('sessions')">&#x1f4cb; Sessions <span class="tab-count" id="sessions-tab-count">0</span></button>
-    <button class="main-tab" id="tab-prs" onclick="switchMainTab('prs')">&#x1f517; Pull Requests <span class="tab-count" id="prs-tab-count">0</span></button>
-    <button class="main-tab" id="tab-notifications" onclick="switchMainTab('notifications')">&#x1f514; Notifications <span class="tab-count" id="notifications-tab-count">0</span></button>
-    <button class="main-tab" id="tab-settings" onclick="switchMainTab('settings')">&#x2699;&#xfe0f; Settings <span class="tab-count">6</span></button>
+    <button class="main-tab active" id="tab-sessions" onclick="switchMainTab('sessions')"><span class="tab-emoji">&#x1f4cb;</span><span class="tab-label"> Sessions</span> <span class="tab-count" id="sessions-tab-count">0</span></button>
+    <button class="main-tab" id="tab-prs" onclick="switchMainTab('prs')"><span class="tab-emoji">&#x1f517;</span><span class="tab-label"> Pull Requests</span> <span class="tab-count" id="prs-tab-count">0</span></button>
+    <button class="main-tab" id="tab-notifications" onclick="switchMainTab('notifications')"><span class="tab-emoji">&#x1f514;</span><span class="tab-label"> Notifications</span> <span class="tab-count" id="notifications-tab-count">0</span></button>
+    <button class="main-tab" id="tab-settings" onclick="switchMainTab('settings')"><span class="tab-emoji">&#x2699;&#xfe0f;</span><span class="tab-label"> Settings</span> <span class="tab-count">6</span></button>
   </div>
 
   <div class="sessions-view" id="sessions-view">
