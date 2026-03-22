@@ -2490,6 +2490,38 @@ button, a, .filter-btn, .main-tab, .session-card, .pr-card, .notif-card {
     justify-content: center;
   }
   .main-tab .tab-label { display: none; }
+
+  /* Mobile filter bar fix */
+  .session-filters, .pr-filters, .notification-filters {
+    display: flex;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    gap: 6px;
+    padding: 4px 0;
+    flex-wrap: nowrap;
+    scrollbar-width: none;
+  }
+  .session-filters::-webkit-scrollbar, .pr-filters::-webkit-scrollbar, .notification-filters::-webkit-scrollbar {
+    display: none;
+  }
+  .filter-btn {
+    flex-shrink: 0;
+    font-size: 12px;
+    padding: 6px 10px;
+    white-space: nowrap;
+    border-radius: 14px;
+  }
+  .search-input {
+    width: 100%;
+    margin: 6px 0;
+    font-size: 16px;
+    box-sizing: border-box;
+  }
+  /* Fix session card bottom safe area */
+  .session-card:last-child, .pr-card:last-child, .notif-card:last-child {
+    margin-bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+  }
+
   .main-tab .tab-count {
     position: absolute;
     top: 2px;
