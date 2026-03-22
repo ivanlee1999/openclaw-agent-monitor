@@ -130,7 +130,7 @@ function getSessionMeta(sessionId) {
     if (session) {
       return {
         harnessSessionId: session.harnessSessionId || sessionId,
-        harnessName: session.harnessName || null
+        harnessName: session.harness || session.harnessName || null
       };
     }
   } catch {}
