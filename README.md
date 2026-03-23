@@ -40,6 +40,7 @@ Open [http://localhost:3847](http://localhost:3847).
 
 | Endpoint | Description |
 |---|---|
+| `GET /health` | Lightweight health check returning `{ ok: true, uptime }` |
 | `GET /` | Dashboard UI |
 | `GET /api/sessions` | All sessions (supports `?status=running&q=search`) |
 | `GET /api/sessions/:id/output` | Raw text output for a session |

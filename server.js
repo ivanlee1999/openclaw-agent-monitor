@@ -349,6 +349,13 @@ function readSessions() {
 
 // --- API ---
 
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    uptime: process.uptime()
+  });
+});
+
 app.get("/api/sessions", async (req, res) => {
   try {
     let sessions = readSessions();
