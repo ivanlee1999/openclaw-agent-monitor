@@ -8,6 +8,7 @@ const { promisify } = require("util");
 const execFileAsync = promisify(execFile);
 const JSON5 = require("json5");
 const Database = require("better-sqlite3");
+const { version: appVersion } = require("./package.json");
 
 const DB_PATH = path.join(os.homedir(), ".openclaw", "dashboard.db");
 const db = new Database(DB_PATH);
@@ -353,6 +354,14 @@ function readSessions() {
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
+    uptime: process.uptime()
+  });
+});
+
+app.get("/api/version", (_req, res) => {
+  res.json({
+    version: appVersion,
+    node: process.version,
     uptime: process.uptime()
   });
 });
