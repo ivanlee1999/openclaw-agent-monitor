@@ -1,4 +1,4 @@
-// Health check added by pipeline test
+// Pipeline v2 test - all 3 stages
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
