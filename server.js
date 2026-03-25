@@ -4420,6 +4420,10 @@ const BIND_HOST = (() => {
   return (idx !== -1 && process.argv[idx + 1]) ? process.argv[idx + 1] : '127.0.0.1';
 })();
 
-app.listen(PORT, BIND_HOST, () => {
-  console.log("OpenClaw Dashboard running at http://" + BIND_HOST + ":" + PORT);
-});
+if (require.main === module) {
+  app.listen(PORT, BIND_HOST, () => {
+    console.log("OpenClaw Dashboard running at http://" + BIND_HOST + ":" + PORT);
+  });
+}
+
+module.exports = app;

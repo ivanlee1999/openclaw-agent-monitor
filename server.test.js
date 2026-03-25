@@ -1,0 +1,58 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const http = require("node:http");
+const app = require("./server");
+
+/**
+ * Start the Express app on an ephemeral port and return
+ * { server, baseUrl, close() }.
+ */
+function listen(expressApp) {
+  return new Promise((resolve, reject) => {
+    const server = expressApp.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      resolve({
+        server,
+        baseUrl: `http://127.0.0.1:${port}`,
+        close: () => new Promise((res) => server.close(res)),
+      });
+    });
+    server.on("error", reject);
+  });
+}
+
+/**
+ * Minimal fetch helper using Node's built-in http module so the test
+ * has zero extra dependencies.
+ */
+function get(url) {
+  return new Promise((resolve, reject) => {
+    http.get(url, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => resolve({ status: res.statusCode, body: data }));
+    }).on("error", reject);
+  });
+}
+
+test("GET /api/version returns version metadata", async () => {
+  const { baseUrl, close } = await listen(app);
+  try {
+    const { status, body } = await get(`${baseUrl}/api/version`);
+    assert.equal(status, 200);
+
+    const json = JSON.parse(body);
+
+    // version must match package.json
+    assert.equal(json.version, "1.0.0");
+
+    // node version string starts with "v"
+    assert.match(json.node, /^v\d+/);
+
+    // uptime is a positive number (seconds)
+    assert.equal(typeof json.uptime, "number");
+    assert.ok(json.uptime >= 0, "uptime should be non-negative");
+  } finally {
+    await close();
+  }
+});
