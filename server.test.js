@@ -1,6 +1,15 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const http = require("node:http");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+// Ensure ~/.openclaw exists before requiring the server, which opens the DB
+// at import time. Without this, tests fail in fresh environments.
+const openclawDir = path.join(os.homedir(), ".openclaw");
+fs.mkdirSync(openclawDir, { recursive: true });
+
 const app = require("./server");
 
 /**
@@ -52,6 +61,26 @@ test("GET /api/version returns version metadata", async () => {
     // uptime is a positive number (seconds)
     assert.equal(typeof json.uptime, "number");
     assert.ok(json.uptime >= 0, "uptime should be non-negative");
+  } finally {
+    await close();
+  }
+});
+
+test("GET /api/ping returns pong status and current timestamp", async () => {
+  const { baseUrl, close } = await listen(app);
+  const before = Date.now();
+
+  try {
+    const { status, body } = await get(`${baseUrl}/api/ping`);
+    const after = Date.now();
+
+    assert.equal(status, 200);
+
+    const json = JSON.parse(body);
+    assert.equal(json.pong, true);
+    assert.equal(typeof json.timestamp, "number");
+    assert.ok(json.timestamp >= before, "timestamp should be >= time before request");
+    assert.ok(json.timestamp <= after, "timestamp should be <= time after request");
   } finally {
     await close();
   }
