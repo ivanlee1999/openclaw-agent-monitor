@@ -1,4 +1,4 @@
-// Pipeline v2 test - all 3 stages
+// Final pipeline test - all 3 stages should complete
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
