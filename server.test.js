@@ -10,6 +10,7 @@ const path = require("node:path");
 const openclawDir = path.join(os.homedir(), ".openclaw");
 fs.mkdirSync(openclawDir, { recursive: true });
 
+// waitForStartup test
 const app = require("./server");
 
 /**
