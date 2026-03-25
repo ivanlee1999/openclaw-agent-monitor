@@ -3039,6 +3039,8 @@ let activeTab = {};
 let previewCache = {};
 let timelineOrder = {};
 let searchQuery = "";
+let sessionRenderCache = {};
+let sessionsDataKey = "";
 
 // Debounce search
 let searchTimeout = null;
@@ -3212,11 +3214,8 @@ function toolIcon(tool) {
 }
 
 // --- Rendering ---
-function renderSessions() {
-  const list = document.getElementById("sessions-list");
+function getFilteredSessions() {
   let filtered = activeFilter === "all" ? sessions : sessions.filter(s => s.status === activeFilter);
-
-  // Client-side search
   if (searchQuery) {
     const q = searchQuery.toLowerCase();
     filtered = filtered.filter(s =>
@@ -3226,49 +3225,125 @@ function renderSessions() {
       (s.sessionId || "").toLowerCase().includes(q)
     );
   }
+  return filtered;
+}
 
-  // Add/remove grid class based on expansion
-  if (expandedId) {
-    list.classList.add("has-expanded");
-  } else {
-    list.classList.remove("has-expanded");
+function getSessionRenderKey(s) {
+  return JSON.stringify({
+    s: s,
+    expanded: expandedId === s.sessionId,
+    tab: activeTab[s.sessionId] || "timeline",
+    preview: previewCache[s.sessionId] || null,
+    output: expandedId === s.sessionId ? (outputCache[s.sessionId] || null) : "__collapsed__",
+    history: expandedId === s.sessionId ? (historyCache[s.sessionId] || null) : "__collapsed__",
+    order: timelineOrder[s.sessionId] || "newest"
+  });
+}
+
+function renderSessionCard(s) {
+  const st = s.status || "unknown";
+  const isExpanded = expandedId === s.sessionId;
+  return '<div class="session-card ' + st + (isExpanded ? ' expanded' : '') + '" data-id="' + s.sessionId + '">'
+    + '<div class="card-header">'
+    + '<div>'
+    + '<div class="card-top-row">'
+    + '<span class="badge ' + st + '">' + st + '</span>'
+    + '<span class="session-name">' + escHtml(s.name || s.sessionId) + '</span>'
+    + '</div>'
+    + '<div class="card-meta">'
+    + '<span>&#x1f4c1; ' + escHtml(truncate(s.workdir || "", 50)) + '</span>'
+    + '<span>&#x23f1;&#xfe0f; ' + duration(s.createdAt, s.completedAt) + '</span>'
+    + '<span>&#x1f552; ' + relativeTime(s.createdAt) + '</span>'
+    + (s.model ? '<span>&#x1f916; ' + escHtml(s.model) + '</span>' : '')
+    + (s.harness ? '<span>&#x2699;&#xfe0f; ' + escHtml(s.harness) + '</span>' : '')
+    + (s.claudeModel ? '<span>&#x1f9e0; ' + escHtml(s.claudeModel) + '</span>' : '')
+    + '</div>'
+    + '</div>'
+    + '<div class="card-cost">' + formatCost(s.costUsd) + '</div>'
+    + '</div>'
+    + '<div class="card-prompt" style="padding:0 24px 8px 24px">' + escHtml(truncate(s.prompt || "", 120)) + '</div>'
+    + renderPreview(s)
+    + '<div class="card-output' + (isExpanded ? ' open' : '') + '" id="output-' + s.sessionId + '">'
+    + (isExpanded ? getOutputHtml(s.sessionId) : '')
+    + '</div>'
+    + '</div>';
+}
+
+function invalidateSessionCard(id) {
+  delete sessionRenderCache[id];
+}
+
+function renderSessions() {
+  const list = document.getElementById("sessions-list");
+  const filtered = getFilteredSessions();
+
+  // Reconcile expandedId: clear if session no longer exists
+  if (expandedId && !sessions.some(s => s.sessionId === expandedId)) {
+    expandedId = null;
   }
 
+  // Only apply expanded layout if expanded card is visible in current filter
+  const expandedVisible = expandedId && filtered.some(s => s.sessionId === expandedId);
+  list.classList.toggle("has-expanded", Boolean(expandedVisible));
+
   if (filtered.length === 0) {
+    sessionRenderCache = {};
     list.innerHTML = '<div class="empty-state"><div class="icon">&#x1f43e;</div>'
       + '<h2>No sessions found</h2><p>' + (sessions.length === 0 ? 'Waiting for sessions...' : 'No sessions match this filter') + '</p></div>';
     return;
   }
 
-  list.innerHTML = filtered.map(s => {
-    const st = s.status || "unknown";
-    const isExpanded = expandedId === s.sessionId;
-    return '<div class="session-card ' + st + (isExpanded ? ' expanded' : '') + '" data-id="' + s.sessionId + '">'
-      + '<div class="card-header" onclick="toggleSession(\\'' + s.sessionId + '\\')">'
-      + '<div>'
-      + '<div class="card-top-row">'
-      + '<span class="badge ' + st + '">' + st + '</span>'
-      + '<span class="session-name">' + escHtml(s.name || s.sessionId) + '</span>'
-      + '</div>'
-      + '<div class="card-meta">'
-      + '<span>&#x1f4c1; ' + escHtml(truncate(s.workdir || "", 50)) + '</span>'
-      + '<span>&#x23f1;&#xfe0f; ' + duration(s.createdAt, s.completedAt) + '</span>'
-      + '<span>&#x1f552; ' + relativeTime(s.createdAt) + '</span>'
-      + (s.model ? '<span>&#x1f916; ' + escHtml(s.model) + '</span>' : '')
-      + (s.harness ? '<span>&#x2699;&#xfe0f; ' + escHtml(s.harness) + '</span>' : '')
-      + (s.claudeModel ? '<span>&#x1f9e0; ' + escHtml(s.claudeModel) + '</span>' : '')
-      + '</div>'
-      + '</div>'
-      + '<div class="card-cost">' + formatCost(s.costUsd) + '</div>'
-      + '</div>'
-      + '<div class="card-prompt" style="padding:0 24px 8px 24px">' + escHtml(truncate(s.prompt || "", 120)) + '</div>'
-      + renderPreview(s)
-      + '<div class="card-output' + (isExpanded ? ' open' : '') + '" id="output-' + s.sessionId + '">'
-      + (isExpanded ? getOutputHtml(s.sessionId) : '')
-      + '</div>'
-      + '</div>';
-  }).join("");
+  // Build a map of existing card DOM nodes keyed by session ID
+  const existing = new Map(
+    [...list.querySelectorAll(".session-card")].map(el => [el.dataset.id, el])
+  );
+
+  const nextNodes = [];
+  const nextCache = {};
+
+  for (const s of filtered) {
+    const key = getSessionRenderKey(s);
+    nextCache[s.sessionId] = key;
+
+    let card = existing.get(s.sessionId);
+    if (!card) {
+      // New card: create from HTML
+      const tpl = document.createElement("template");
+      tpl.innerHTML = renderSessionCard(s);
+      card = tpl.content.firstElementChild;
+    } else if (sessionRenderCache[s.sessionId] !== key) {
+      // Card changed: replace with new node
+      const tpl = document.createElement("template");
+      tpl.innerHTML = renderSessionCard(s);
+      const newCard = tpl.content.firstElementChild;
+      card.replaceWith(newCard);
+      card = newCard;
+    }
+    // else: card unchanged, keep existing DOM node as-is
+
+    nextNodes.push(card);
+  }
+
+  // Remove cards that are no longer in the filtered list
+  for (const [id, el] of existing) {
+    if (!nextCache[id]) el.remove();
+  }
+
+  // Remove any non-card elements (e.g. empty-state div from previous render)
+  const nonCards = list.querySelectorAll(":scope > :not(.session-card)");
+  nonCards.forEach(el => el.remove());
+
+  // Reorder existing nodes to match filtered order
+  for (let i = 0; i < nextNodes.length; i++) {
+    const node = nextNodes[i];
+    if (list.children[i] !== node) {
+      list.insertBefore(node, list.children[i] || null);
+    }
+  }
+
+  sessionRenderCache = nextCache;
 }
+
 
 function escHtml(s) {
   if (!s) return "";
@@ -3538,14 +3613,35 @@ document.querySelector(".filter-bar").addEventListener("click", (e) => {
   renderSessions();
 });
 
+// --- Delegated click handler for session cards ---
+document.getElementById("sessions-list").addEventListener("click", (e) => {
+  // Don't toggle if clicking interactive child elements
+  const interactive = e.target.closest("button, a, .tl-show-more, .tab-btn, .timeline-sort-btn, .output-actions");
+  if (interactive) return;
+
+  const header = e.target.closest(".card-header");
+  if (!header) return;
+
+  const card = header.closest(".session-card");
+  if (!card) return;
+
+  toggleSession(card.dataset.id);
+});
+
 // --- Polling ---
 async function fetchSessions() {
   try {
     const res = await fetch("/api/sessions");
     if (!res.ok) throw new Error("fetch failed");
-    sessions = await res.json();
+    const nextSessions = await res.json();
+    const nextKey = JSON.stringify(nextSessions);
+    const changed = nextKey !== sessionsDataKey;
+    sessions = nextSessions;
     updateStats();
-    renderSessions();
+    if (changed) {
+      sessionsDataKey = nextKey;
+      renderSessions();
+    }
     fetchPreviews();
   } catch (err) {
     console.error("Failed to fetch sessions:", err);
@@ -3561,7 +3657,10 @@ function fetchPreviews() {
         .then(data => {
           const changed = JSON.stringify(previewCache[s.sessionId]) !== JSON.stringify(data);
           previewCache[s.sessionId] = data;
-          if (changed) renderSessions();
+          if (changed) {
+            invalidateSessionCard(s.sessionId);
+            renderSessions();
+          }
         })
         .catch(() => {});
     }
@@ -3583,14 +3682,23 @@ setInterval(() => {
         fetch("/api/sessions/" + encodeURIComponent(expandedId) + "/output")
           .then(r => r.ok ? r.text() : null)
           .then(text => {
-            if (text !== null) { outputCache[expandedId] = text; renderSessions(); }
+            if (text !== null && text !== outputCache[expandedId]) {
+              outputCache[expandedId] = text;
+              invalidateSessionCard(expandedId);
+              renderSessions();
+            }
           })
           .catch(() => {});
       } else {
         fetch("/api/sessions/" + encodeURIComponent(expandedId) + "/history")
           .then(r => r.ok ? r.json() : null)
           .then(data => {
-            if (data !== null) { historyCache[expandedId] = data; renderSessions(); }
+            const changed = JSON.stringify(historyCache[expandedId]) !== JSON.stringify(data);
+            if (data !== null && changed) {
+              historyCache[expandedId] = data;
+              invalidateSessionCard(expandedId);
+              renderSessions();
+            }
           })
           .catch(() => {});
       }
