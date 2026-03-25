@@ -360,8 +360,7 @@ app.get("/health", (_req, res) => {
 
 app.get("/api/ping", (_req, res) => {
   res.json({
-    pong: true,
-    timestamp: Date.now()
+    pong: true
   });
 });
 

@@ -67,21 +67,16 @@ test("GET /api/version returns version metadata", async () => {
   }
 });
 
-test("GET /api/ping returns pong status and current timestamp", async () => {
+test("GET /api/ping returns pong status", async () => {
   const { baseUrl, close } = await listen(app);
-  const before = Date.now();
 
   try {
     const { status, body } = await get(`${baseUrl}/api/ping`);
-    const after = Date.now();
 
     assert.equal(status, 200);
 
     const json = JSON.parse(body);
-    assert.equal(json.pong, true);
-    assert.equal(typeof json.timestamp, "number");
-    assert.ok(json.timestamp >= before, "timestamp should be >= time before request");
-    assert.ok(json.timestamp <= after, "timestamp should be <= time after request");
+    assert.deepEqual(json, { pong: true });
   } finally {
     await close();
   }
