@@ -409,6 +409,120 @@ app.get("/api/sessions", async (req, res) => {
   }
 });
 
+// --- Pipeline grouping logic ---
+const STAGE_PATTERNS = [
+  { regex: /-codex-plan$/, kind: "codex-plan", order: 1 },
+  { regex: /-claude-implement$/, kind: "claude-implement", order: 2 },
+  { regex: /-codex-review$/, kind: "codex-review", order: 3 },
+  { regex: /-claude-fix-(\d+)$/, kind: "claude-fix", order: 100 },   // order computed dynamically
+  { regex: /-codex-review-(\d+)$/, kind: "codex-review", order: 100 }, // order computed dynamically
+];
+
+function parsePipelineStage(sessionName) {
+  if (!sessionName) return null;
+  for (const pat of STAGE_PATTERNS) {
+    const m = sessionName.match(pat.regex);
+    if (m) {
+      const prefix = sessionName.slice(0, m.index);
+      if (!prefix) continue; // must have a prefix
+      const roundNum = m[1] ? parseInt(m[1]) : 0;
+      let kind = pat.kind;
+      let order = pat.order;
+      if (roundNum > 0) {
+        kind = pat.kind + "-" + roundNum;
+        // fix rounds: order 4,6,8,... review rounds: order 5,7,9,...
+        if (pat.kind === "claude-fix") {
+          order = 2 + roundNum * 2;       // fix-1=4, fix-2=6, fix-3=8
+        } else {
+          order = 3 + roundNum * 2;       // review-1=5, review-2=7, review-3=9
+        }
+      }
+      return { prefix, kind, order };
+    }
+  }
+  return null;
+}
+
+function derivePipelineStatus(stages) {
+  const statuses = stages.map(s => s.session.status);
+  if (statuses.some(st => st === "failed")) return "failed";
+  if (statuses.some(st => st === "running")) return "running";
+  if (statuses.some(st => st === "killed")) return "killed";
+  if (statuses.every(st => st === "completed")) return "completed";
+  return "running"; // mix of completed and pending
+}
+
+function groupIntoPipelines(sessions) {
+  const pipelineMap = new Map(); // prefix -> { stages: [] }
+  const standalone = [];
+
+  for (const s of sessions) {
+    const parsed = parsePipelineStage(s.name);
+    if (parsed) {
+      if (!pipelineMap.has(parsed.prefix)) {
+        pipelineMap.set(parsed.prefix, []);
+      }
+      pipelineMap.get(parsed.prefix).push({
+        kind: parsed.kind,
+        session: s,
+        order: parsed.order,
+      });
+    } else {
+      standalone.push(s);
+    }
+  }
+
+  // Only treat as a pipeline if it has 2+ stages
+  const pipelines = [];
+  for (const [prefix, stages] of pipelineMap) {
+    if (stages.length < 2) {
+      // Single stage isn't a pipeline — push back to standalone
+      standalone.push(stages[0].session);
+      continue;
+    }
+    stages.sort((a, b) => a.order - b.order);
+    const totalCost = stages.reduce((sum, st) => sum + (st.session.costUsd || 0), 0);
+    const startedAt = Math.min(...stages.map(st => st.session.createdAt || Infinity));
+    const completedTimes = stages.map(st => st.session.completedAt).filter(Boolean);
+    const completedAt = completedTimes.length === stages.length
+      ? Math.max(...completedTimes)
+      : null;
+
+    pipelines.push({
+      pipelineName: prefix,
+      status: derivePipelineStatus(stages),
+      totalCost,
+      startedAt: startedAt === Infinity ? null : startedAt,
+      completedAt,
+      stages,
+    });
+  }
+
+  // Sort pipelines by newest first
+  pipelines.sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
+
+  return { pipelines, standalone };
+}
+
+app.get("/api/pipelines", async (_req, res) => {
+  try {
+    let sessions = readSessions();
+    // Enrich with model
+    sessions = sessions.map(s => {
+      if (!s.model || s.model === "default") {
+        const extracted = extractModelFromJsonl(s.sessionId);
+        if (extracted) s.claudeModel = extracted;
+      }
+      return s;
+    });
+    const { pipelines, standalone } = groupIntoPipelines(sessions);
+    res.json({ pipelines, standalone });
+  } catch (err) {
+    console.error("Error reading pipelines:", err.message);
+    res.status(500).json({ error: "Failed to read pipelines" });
+  }
+});
+
 app.get("/api/stats", (_req, res) => {
   try {
     const sessions = readSessions();
@@ -2057,6 +2171,162 @@ a:hover { text-decoration: underline; }
 }
 .timeline-sort-btn:hover { border-color: var(--accent); color: var(--text-primary); }
 
+/* Pipeline cards */
+.pipeline-card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  border-left: 4px solid var(--text-muted);
+  transition: background 0.1s;
+  overflow: hidden;
+  grid-column: 1 / -1;
+}
+.pipeline-card:hover { background: var(--card-hover); }
+.pipeline-card.running { border-left-color: var(--running); }
+.pipeline-card.completed { border-left-color: var(--completed); }
+.pipeline-card.failed { border-left-color: var(--failed); }
+.pipeline-card.killed { border-left-color: var(--killed); }
+
+.pipeline-header {
+  padding: 18px 24px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.pipeline-header-left {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0;
+}
+.pipeline-name {
+  font-size: 16px; font-weight: 700; color: var(--text-heading);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.pipeline-stage-count {
+  font-size: 11px; color: var(--text-muted); font-weight: 500;
+  background: var(--surface); padding: 2px 8px; border-radius: 8px;
+}
+.pipeline-header-right {
+  display: flex; align-items: center; gap: 16px; flex-shrink: 0;
+}
+.pipeline-duration {
+  font-size: 12px; color: var(--text-secondary);
+}
+.pipeline-cost {
+  font-size: 14px; font-weight: 700; color: var(--text-primary);
+  font-family: var(--mono);
+}
+.pipeline-chevron {
+  font-size: 12px; color: var(--text-muted);
+  transition: transform 0.2s;
+}
+.pipeline-card.expanded .pipeline-chevron { transform: rotate(90deg); }
+
+/* Pipeline stage timeline */
+.pipeline-stages {
+  display: none;
+  border-top: 1px solid var(--border);
+  padding: 16px 24px 20px 24px;
+  background: var(--bg);
+}
+.pipeline-card.expanded .pipeline-stages { display: block; }
+.pipeline-card.expanded:hover { background: var(--card-bg); }
+
+.stage-timeline {
+  position: relative;
+  padding-left: 24px;
+}
+.stage-timeline::before {
+  content: ''; position: absolute; left: 5px; top: 6px; bottom: 6px;
+  width: 2px; background: var(--border);
+}
+
+.stage-entry {
+  position: relative;
+  margin-bottom: 0;
+  padding: 8px 0;
+}
+.stage-entry:last-child { margin-bottom: 0; }
+
+.stage-node {
+  position: absolute; left: -24px; top: 14px;
+  width: 12px; height: 12px; border-radius: 50%;
+  background: var(--text-muted);
+  border: 2px solid var(--bg);
+  z-index: 1;
+}
+.stage-entry.completed .stage-node { background: var(--completed); }
+.stage-entry.failed .stage-node { background: var(--failed); }
+.stage-entry.running .stage-node { background: var(--running); animation: pulse-dot 2s infinite; }
+.stage-entry.killed .stage-node { background: var(--killed); }
+
+/* Stage timeline line coloring by status */
+.stage-entry.completed + .stage-entry .stage-node { }
+.stage-entry::after {
+  content: ''; position: absolute; left: -20px; top: 26px;
+  width: 2px; height: calc(100% - 12px);
+  z-index: 0;
+}
+.stage-entry:last-child::after { display: none; }
+.stage-entry.completed::after { background: var(--completed); }
+.stage-entry.failed::after { background: var(--failed); }
+.stage-entry.running::after { background: var(--running); }
+.stage-entry.killed::after { background: var(--killed); }
+
+.stage-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  padding: 4px 10px;
+  border-radius: 2px;
+  transition: background 0.1s;
+}
+.stage-row:hover { background: var(--surface); }
+
+.stage-icon {
+  font-size: 16px; flex-shrink: 0; width: 22px; text-align: center;
+}
+.stage-kind {
+  font-size: 13px; font-weight: 600; color: var(--text-primary);
+  min-width: 160px;
+}
+.stage-status-icon {
+  font-size: 14px; flex-shrink: 0;
+}
+.stage-duration {
+  font-size: 12px; color: var(--text-secondary); font-family: var(--mono);
+  min-width: 60px;
+}
+.stage-cost {
+  font-size: 12px; color: var(--text-secondary); font-family: var(--mono);
+  min-width: 50px;
+}
+.stage-summary {
+  font-size: 11px; color: var(--text-muted); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; flex: 1;
+}
+
+/* Stage expanded output (reuse session card output) */
+.stage-output {
+  display: none;
+  margin-top: 6px;
+  margin-left: 0;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: var(--card-bg);
+  overflow: hidden;
+}
+.stage-output.open { display: block; }
+
+/* Pipelines section separator */
+.pipelines-section-label {
+  font-size: 11px; font-weight: 600; color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: 1px;
+  padding: 16px 0 8px 0; grid-column: 1 / -1;
+}
+
 /* Empty state */
 .empty-state {
   text-align: center; padding: 80px 20px; color: var(--text-muted);
@@ -2802,6 +3072,7 @@ button, a, .filter-btn, .main-tab, .session-card, .pr-card, .notif-card {
         <input type="text" class="search-input" id="search-input" placeholder="Search sessions..." />
       </div>
     </div>
+    <div id="pipelines-list"></div>
     <div id="sessions-list" class="cards-grid"></div>
   </div>
 
@@ -3046,8 +3317,12 @@ document.addEventListener("DOMContentLoaded", function() {
 });
 
 let sessions = [];
+let pipelines = [];
+let standaloneSessions = [];
 let activeFilter = "all";
 let expandedId = null;
+let expandedPipelineId = null;
+let expandedStageId = null;
 let outputCache = {};
 let historyCache = {};
 let activeTab = {};
@@ -3056,6 +3331,7 @@ let timelineOrder = {};
 let searchQuery = "";
 let sessionRenderCache = {};
 let sessionsDataKey = "";
+let pipelinesDataKey = "";
 
 // Debounce search
 let searchTimeout = null;
@@ -3063,6 +3339,7 @@ document.getElementById("search-input").addEventListener("input", (e) => {
   clearTimeout(searchTimeout);
   searchTimeout = setTimeout(() => {
     searchQuery = e.target.value.trim();
+    renderPipelines();
     renderSessions();
   }, 200);
 });
@@ -3230,7 +3507,8 @@ function toolIcon(tool) {
 
 // --- Rendering ---
 function getFilteredSessions() {
-  let filtered = activeFilter === "all" ? sessions : sessions.filter(s => s.status === activeFilter);
+  let source = standaloneSessions.length > 0 || pipelines.length > 0 ? standaloneSessions : sessions;
+  let filtered = activeFilter === "all" ? source : source.filter(s => s.status === activeFilter);
   if (searchQuery) {
     const q = searchQuery.toLowerCase();
     filtered = filtered.filter(s =>
@@ -3254,6 +3532,179 @@ function getSessionRenderKey(s) {
     order: timelineOrder[s.sessionId] || "newest"
   });
 }
+
+// --- Pipeline rendering ---
+function stageKindLabel(kind) {
+  const labels = {
+    "codex-plan": "Codex Plan",
+    "claude-implement": "Claude Implement",
+    "codex-review": "Codex Review",
+  };
+  if (labels[kind]) return labels[kind];
+  // Handle dynamic kinds like claude-fix-1, codex-review-1
+  const fixM = kind.match(/^claude-fix-(\\d+)$/);
+  if (fixM) return "Claude Fix (round " + fixM[1] + ")";
+  const revM = kind.match(/^codex-review-(\\d+)$/);
+  if (revM) return "Codex Re-review" + (parseInt(revM[1]) > 1 ? " (" + revM[1] + ")" : "");
+  return kind;
+}
+
+function stageHarnessIcon(kind) {
+  if (kind.startsWith("codex")) return "\\u{1f916}";  // robot for Codex
+  if (kind.startsWith("claude")) return "\\u{1f527}";  // wrench for Claude
+  return "\\u{2699}\\ufe0f";
+}
+
+function stageStatusIcon(status) {
+  if (status === "completed") return "\\u2705";
+  if (status === "failed") return "\\u{1f534}";
+  if (status === "running") return "\\u{1f535}";
+  if (status === "killed") return "\\u{1f7e0}";
+  return "\\u26aa";
+}
+
+function getFilteredPipelines() {
+  let filtered = pipelines;
+  if (activeFilter !== "all") {
+    filtered = filtered.filter(p => {
+      if (activeFilter === "running") return p.status === "running";
+      if (activeFilter === "completed") return p.status === "completed";
+      if (activeFilter === "failed") return p.status === "failed";
+      if (activeFilter === "killed") return p.status === "killed";
+      return true;
+    });
+  }
+  if (searchQuery) {
+    const q = searchQuery.toLowerCase();
+    filtered = filtered.filter(p =>
+      p.pipelineName.toLowerCase().includes(q) ||
+      p.stages.some(st => (st.session.name || "").toLowerCase().includes(q))
+    );
+  }
+  return filtered;
+}
+
+function renderPipelineCard(p) {
+  const isExpanded = expandedPipelineId === p.pipelineName;
+  const dur = duration(p.startedAt, p.completedAt);
+
+  let stagesHtml = '<div class="stage-timeline">';
+  for (const stage of p.stages) {
+    const s = stage.session;
+    const st = s.status || "unknown";
+    const isStageExpanded = expandedStageId === s.sessionId;
+    const sDur = duration(s.createdAt, s.completedAt);
+
+    stagesHtml += '<div class="stage-entry ' + st + '">'
+      + '<div class="stage-node"></div>'
+      + '<div class="stage-row" data-stage-id="' + s.sessionId + '">'
+      + '<span class="stage-icon">' + stageHarnessIcon(stage.kind) + '</span>'
+      + '<span class="stage-kind">' + escHtml(stageKindLabel(stage.kind)) + '</span>'
+      + '<span class="stage-status-icon">' + stageStatusIcon(st) + '</span>'
+      + '<span class="stage-duration">' + sDur + '</span>'
+      + '<span class="stage-cost">' + formatCost(s.costUsd) + '</span>'
+      + '<span class="stage-summary">' + escHtml(truncate(s.prompt || "", 80)) + '</span>'
+      + '</div>'
+      + '<div class="stage-output' + (isStageExpanded ? ' open' : '') + '" id="stage-output-' + s.sessionId + '">'
+      + (isStageExpanded ? getOutputHtml(s.sessionId) : '')
+      + '</div>'
+      + '</div>';
+  }
+  stagesHtml += '</div>';
+
+  return '<div class="pipeline-card ' + p.status + (isExpanded ? ' expanded' : '') + '" data-pipeline="' + escHtml(p.pipelineName) + '">'
+    + '<div class="pipeline-header">'
+    + '<div class="pipeline-header-left">'
+    + '<span class="badge ' + p.status + '">' + p.status + '</span>'
+    + '<span class="pipeline-name">' + escHtml(p.pipelineName) + '</span>'
+    + '<span class="pipeline-stage-count">' + p.stages.length + ' stages</span>'
+    + '</div>'
+    + '<div class="pipeline-header-right">'
+    + '<span class="pipeline-duration">\\u23f1\\ufe0f ' + dur + '</span>'
+    + '<span class="pipeline-cost">' + formatCost(p.totalCost) + '</span>'
+    + '<span class="pipeline-chevron">\\u25b6</span>'
+    + '</div>'
+    + '</div>'
+    + '<div class="pipeline-stages">' + stagesHtml + '</div>'
+    + '</div>';
+}
+
+function renderPipelines() {
+  const list = document.getElementById("pipelines-list");
+  const filtered = getFilteredPipelines();
+
+  if (filtered.length === 0) {
+    list.innerHTML = "";
+    return;
+  }
+
+  list.innerHTML = filtered.map(p => renderPipelineCard(p)).join("");
+}
+
+function togglePipeline(pipelineName) {
+  if (expandedPipelineId === pipelineName) {
+    expandedPipelineId = null;
+  } else {
+    expandedPipelineId = pipelineName;
+    expandedStageId = null; // collapse any expanded stage
+  }
+  renderPipelines();
+}
+
+async function toggleStage(sessionId) {
+  if (expandedStageId === sessionId) {
+    expandedStageId = null;
+    renderPipelines();
+    return;
+  }
+  expandedStageId = sessionId;
+  if (!activeTab[sessionId]) activeTab[sessionId] = "timeline";
+  renderPipelines();
+
+  const fetches = [];
+  if (historyCache[sessionId] === undefined) {
+    fetches.push(
+      fetch("/api/sessions/" + encodeURIComponent(sessionId) + "/history")
+        .then(r => r.ok ? r.json() : null)
+        .then(data => { historyCache[sessionId] = data; })
+        .catch(() => { historyCache[sessionId] = null; })
+    );
+  }
+  if (outputCache[sessionId] === undefined) {
+    fetches.push(
+      fetch("/api/sessions/" + encodeURIComponent(sessionId) + "/output")
+        .then(r => r.ok ? r.text() : null)
+        .then(text => { outputCache[sessionId] = text; })
+        .catch(() => { outputCache[sessionId] = null; })
+    );
+  }
+  if (fetches.length > 0) {
+    await Promise.all(fetches);
+    if (expandedStageId === sessionId) renderPipelines();
+  }
+}
+
+// Delegated click handler for pipeline cards
+document.getElementById("pipelines-list").addEventListener("click", (e) => {
+  const interactive = e.target.closest("button, a, .tl-show-more, .tab-btn, .timeline-sort-btn, .output-actions");
+  if (interactive) return;
+
+  // Check if clicking a stage row
+  const stageRow = e.target.closest(".stage-row");
+  if (stageRow) {
+    e.stopPropagation();
+    toggleStage(stageRow.dataset.stageId);
+    return;
+  }
+
+  // Check if clicking pipeline header
+  const header = e.target.closest(".pipeline-header");
+  if (header) {
+    const card = header.closest(".pipeline-card");
+    if (card) togglePipeline(card.dataset.pipeline);
+    return;
+  }
+});
 
 function renderSessionCard(s) {
   const st = s.status || "unknown";
@@ -3554,16 +4005,17 @@ function switchTab(id, tab) {
   if (tab === "raw" && outputCache[id] === undefined) {
     fetch("/api/sessions/" + encodeURIComponent(id) + "/output")
       .then(r => r.ok ? r.text() : null)
-      .then(text => { outputCache[id] = text; if (expandedId === id) renderSessions(); })
-      .catch(() => { outputCache[id] = null; if (expandedId === id) renderSessions(); });
+      .then(text => { outputCache[id] = text; if (expandedId === id) renderSessions(); if (expandedStageId === id) renderPipelines(); })
+      .catch(() => { outputCache[id] = null; if (expandedId === id) renderSessions(); if (expandedStageId === id) renderPipelines(); });
   }
   if (tab === "timeline" && historyCache[id] === undefined) {
     fetch("/api/sessions/" + encodeURIComponent(id) + "/history")
       .then(r => r.ok ? r.json() : null)
-      .then(data => { historyCache[id] = data; if (expandedId === id) renderSessions(); })
-      .catch(() => { historyCache[id] = null; if (expandedId === id) renderSessions(); });
+      .then(data => { historyCache[id] = data; if (expandedId === id) renderSessions(); if (expandedStageId === id) renderPipelines(); })
+      .catch(() => { historyCache[id] = null; if (expandedId === id) renderSessions(); if (expandedStageId === id) renderPipelines(); });
   }
   renderSessions();
+  if (expandedStageId === id) renderPipelines();
 }
 
 async function toggleSession(id) {
@@ -3609,6 +4061,7 @@ function toggleTimelineOrder(id) {
   const current = timelineOrder[id] || "newest";
   timelineOrder[id] = current === "newest" ? "oldest" : "newest";
   renderSessions();
+  if (expandedStageId === id) renderPipelines();
 }
 
 function updateStats() {
@@ -3625,6 +4078,7 @@ document.querySelector(".filter-bar").addEventListener("click", (e) => {
   document.querySelectorAll(".filter-btn").forEach(b => b.classList.remove("active"));
   e.target.classList.add("active");
   activeFilter = e.target.dataset.filter;
+  renderPipelines();
   renderSessions();
 });
 
@@ -3646,15 +4100,33 @@ document.getElementById("sessions-list").addEventListener("click", (e) => {
 // --- Polling ---
 async function fetchSessions() {
   try {
-    const res = await fetch("/api/sessions");
-    if (!res.ok) throw new Error("fetch failed");
-    const nextSessions = await res.json();
+    const [sessRes, pipeRes] = await Promise.all([
+      fetch("/api/sessions"),
+      fetch("/api/pipelines"),
+    ]);
+    if (!sessRes.ok) throw new Error("fetch sessions failed");
+    const nextSessions = await sessRes.json();
     const nextKey = JSON.stringify(nextSessions);
-    const changed = nextKey !== sessionsDataKey;
+    const sessChanged = nextKey !== sessionsDataKey;
     sessions = nextSessions;
     updateStats();
-    if (changed) {
+
+    // Parse pipeline data
+    let pipeChanged = false;
+    if (pipeRes.ok) {
+      const pipeData = await pipeRes.json();
+      const pipeKey = JSON.stringify(pipeData);
+      pipeChanged = pipeKey !== pipelinesDataKey;
+      if (pipeChanged) {
+        pipelinesDataKey = pipeKey;
+        pipelines = pipeData.pipelines || [];
+        standaloneSessions = pipeData.standalone || [];
+      }
+    }
+
+    if (sessChanged || pipeChanged) {
       sessionsDataKey = nextKey;
+      renderPipelines();
       renderSessions();
     }
     fetchPreviews();
