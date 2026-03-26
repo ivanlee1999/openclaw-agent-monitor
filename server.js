@@ -12,7 +12,20 @@ const Database = require("better-sqlite3");
 const { version: appVersion } = require("./package.json");
 
 // --- Webhook & SSE Configuration ---
-const GITHUB_WEBHOOK_SECRET = process.env.OPENCLAW_WEBHOOK_SECRET || crypto.randomBytes(32).toString("hex");
+const GITHUB_WEBHOOK_SECRET = (() => {
+  if (process.env.OPENCLAW_WEBHOOK_SECRET) return process.env.OPENCLAW_WEBHOOK_SECRET;
+  // Persist a generated secret so webhooks survive restarts
+  const secretPath = path.join(os.homedir(), ".openclaw", "dashboard-webhook-secret");
+  try {
+    return fs.readFileSync(secretPath, "utf-8").trim();
+  } catch {
+    const secret = crypto.randomBytes(32).toString("hex");
+    try { fs.mkdirSync(path.dirname(secretPath), { recursive: true }); } catch {}
+    fs.writeFileSync(secretPath, secret, { mode: 0o600 });
+    console.log("[webhook] Generated and persisted new webhook secret to", secretPath);
+    return secret;
+  }
+})();
 const SSE_HEARTBEAT_MS = 30000;
 const SAFETY_REFRESH_MS = 30 * 60 * 1000; // 30 minutes
 const NOTIFICATION_FALLBACK_MS = 5 * 60 * 1000; // 5 minutes — shorter fallback for notifications
