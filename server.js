@@ -3,12 +3,25 @@ const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const crypto = require("crypto");
 const { execFile, execSync } = require("child_process");
 const { promisify } = require("util");
 const execFileAsync = promisify(execFile);
 const JSON5 = require("json5");
 const Database = require("better-sqlite3");
 const { version: appVersion } = require("./package.json");
+
+// --- Webhook & SSE Configuration ---
+const GITHUB_WEBHOOK_SECRET = "openclaw-dashboard-webhook-2026";
+const SSE_HEARTBEAT_MS = 30000;
+const SAFETY_REFRESH_MS = 30 * 60 * 1000; // 30 minutes
+const PUBLIC_BASE_URL = process.env.OPENCLAW_PUBLIC_URL || "";
+
+const sseClients = new Set();
+const etagCache = {
+  prs: new Map(),           // key: owner/repo or "all"
+  notifications: new Map()  // key: owner/repo/number or "all"
+};
 
 const DB_PATH = path.join(os.homedir(), ".openclaw", "dashboard.db");
 const db = new Database(DB_PATH);
@@ -934,6 +947,221 @@ function formatPRResponse(pr, ghData) {
   };
 }
 
+// --- SSE Broadcast & DB Snapshot Helpers ---
+
+function getPRRows() {
+  return db.prepare("SELECT * FROM prs ORDER BY created_at DESC").all();
+}
+
+function getNotificationRows() {
+  return db.prepare("SELECT * FROM notifications ORDER BY created_at DESC").all();
+}
+
+function formatPRRow(row) {
+  return {
+    url: row.url, owner: row.owner, repo: row.repo, number: row.number,
+    title: row.title || "", state: row.state || "unknown",
+    merged: row.merged === 1, draft: row.draft === 1,
+    createdAt: row.created_at || "", updatedAt: row.updated_at || "",
+    author: row.author || "", reviewComments: row.review_comments || 0,
+    reviews: row.reviews || 0, checks: row.checks || "unknown",
+    labels: JSON.parse(row.labels || "[]"), mergeable: row.mergeable === 1,
+    sessionName: row.session_name || "", sessionId: row.session_id || ""
+  };
+}
+
+function formatNotificationRow(row) {
+  return {
+    type: row.type, id: row.id,
+    pr: { owner: row.pr_owner, repo: row.pr_repo, number: row.pr_number, title: row.pr_title || "" },
+    user: row.user, body: row.body || "",
+    path: row.path || undefined, line: row.line || undefined,
+    diffHunk: row.diff_hunk || undefined, state: row.state || undefined,
+    priority: row.priority || "low", createdAt: row.created_at,
+    read: row.read === 1
+  };
+}
+
+function broadcastEvent(type, data) {
+  const payload = `data: ${JSON.stringify({ type, data })}\n\n`;
+  for (const client of sseClients) {
+    try { client.res.write(payload); } catch {}
+  }
+}
+
+function broadcastPRList() {
+  const rows = getPRRows();
+  broadcastEvent("pr-list", rows.map(formatPRRow));
+  broadcastEvent("counts", { prs: rows.length, notifications: getNotificationRows().length });
+}
+
+function broadcastNotificationList() {
+  const rows = getNotificationRows();
+  broadcastEvent("notification-list", rows.map(formatNotificationRow));
+  broadcastEvent("counts", { prs: getPRRows().length, notifications: rows.length });
+}
+
+function upsertPRFromWebhook(prUrl, owner, repo, number, webhookData, existingRow) {
+  const now = Date.now();
+  const args = [
+    prUrl, owner, repo, number,
+    webhookData.title || (existingRow ? existingRow.title : ""),
+    webhookData.state || (existingRow ? existingRow.state : "open"),
+    webhookData.merged ? 1 : (existingRow ? existingRow.merged : 0),
+    webhookData.draft ? 1 : (existingRow ? existingRow.draft : 0),
+    webhookData.createdAt || (existingRow ? existingRow.created_at : ""),
+    webhookData.updatedAt || (existingRow ? existingRow.updated_at : ""),
+    webhookData.author || (existingRow ? existingRow.author : ""),
+    existingRow ? existingRow.review_comments : 0,
+    existingRow ? existingRow.reviews : 0,
+    existingRow ? existingRow.checks : "unknown",
+    webhookData.labels ? JSON.stringify(webhookData.labels) : (existingRow ? existingRow.labels : "[]"),
+    existingRow ? existingRow.mergeable : 0,
+    webhookData.body || (existingRow ? existingRow.body : ""),
+    existingRow ? existingRow.session_name : "",
+    existingRow ? existingRow.session_id : "",
+    now,
+    existingRow ? existingRow.discovered_at : now
+  ];
+  db.prepare(`INSERT OR REPLACE INTO prs (url, owner, repo, number, title, state, merged, draft, created_at, updated_at, author, review_comments, reviews, checks, labels, mergeable, body, session_name, session_id, fetched_at, discovered_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(...args);
+}
+
+function upsertNotificationPreserveRead(id, type, prUrl, owner, repo, number, prTitle, user, body, filePath, line, diffHunk, state, priority, createdAt) {
+  const now = Date.now();
+  // Check if already exists to preserve read state
+  const existing = db.prepare("SELECT read FROM notifications WHERE id = ?").get(String(id));
+  const readState = existing ? existing.read : 0;
+  db.prepare(`INSERT OR REPLACE INTO notifications
+    (id, type, pr_url, pr_owner, pr_repo, pr_number, pr_title, user, body, path, line, diff_hunk, state, priority, created_at, read, fetched_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    String(id), type, prUrl, owner, repo, number, prTitle || "",
+    user || "", body || "", filePath || null, line || null,
+    diffHunk || null, state || null, priority || "low",
+    createdAt || "", readState, now
+  );
+}
+
+// --- Webhook Handler ---
+const BOT_PATTERNS_WH = ['[bot]', 'copilot', 'github-actions', 'dependabot'];
+function isBotUser(login) {
+  if (!login) return false;
+  const lower = login.toLowerCase();
+  return BOT_PATTERNS_WH.some(p => lower.includes(p));
+}
+
+async function handleGitHubWebhook(event, payload) {
+  console.log("[webhook] Received event:", event, "action:", payload.action);
+
+  if (event === "pull_request") {
+    const pr = payload.pull_request;
+    if (!pr) return;
+    const owner = payload.repository?.owner?.login || "";
+    const repo = payload.repository?.name || "";
+    const number = pr.number;
+    const prUrl = `https://github.com/${owner}/${repo}/pull/${number}`;
+    const existingRow = db.prepare("SELECT * FROM prs WHERE url = ?").get(prUrl);
+
+    const state = pr.merged ? "merged" : pr.state === "closed" ? "closed" : "open";
+    const labels = (pr.labels || []).map(l => typeof l === "string" ? l : l.name || "");
+
+    upsertPRFromWebhook(prUrl, owner, repo, number, {
+      title: pr.title, state, merged: pr.merged || false,
+      draft: pr.draft || false, createdAt: pr.created_at, updatedAt: pr.updated_at,
+      author: pr.user?.login || "", labels, body: pr.body || ""
+    }, existingRow);
+
+    console.log("[webhook] Upserted PR", prUrl, "action:", payload.action);
+
+    // For actions that materially change card state, do a full refresh for checks/mergeable
+    const needsFullRefresh = ["opened", "synchronize", "ready_for_review", "reopened"].includes(payload.action);
+    if (needsFullRefresh) {
+      try {
+        const ghData = await fetchPRDetailsViaGh(prUrl);
+        if (ghData) {
+          const fullState = ghData.state === "MERGED" ? "merged" : ghData.state === "CLOSED" ? "closed" : "open";
+          const now = Date.now();
+          const row = db.prepare("SELECT * FROM prs WHERE url = ?").get(prUrl);
+          db.prepare(`UPDATE prs SET title=?, state=?, merged=?, draft=?, checks=?, mergeable=?, review_comments=?, reviews=?, labels=?, fetched_at=? WHERE url=?`).run(
+            ghData.title || row.title, fullState, ghData.state === "MERGED" ? 1 : 0,
+            ghData.isDraft ? 1 : 0, "unknown",
+            ghData.mergeable === "MERGEABLE" ? 1 : 0,
+            Array.isArray(ghData.comments) ? ghData.comments.length : (ghData.comments || 0),
+            Array.isArray(ghData.reviews) ? ghData.reviews.length : (ghData.reviews?.length || 0),
+            JSON.stringify(ghData.labels?.map(l => l.name) || []),
+            now, prUrl
+          );
+        }
+      } catch (err) {
+        console.error("[webhook] Full PR refresh failed:", err.message);
+      }
+    }
+
+    broadcastPRList();
+  }
+
+  if (event === "pull_request_review") {
+    const review = payload.review;
+    const pr = payload.pull_request;
+    if (!review || !pr) return;
+    const owner = payload.repository?.owner?.login || "";
+    const repo = payload.repository?.name || "";
+    const number = pr.number;
+    const prUrl = `https://github.com/${owner}/${repo}/pull/${number}`;
+    const user = review.user?.login || "";
+    const priority = isBotUser(user) ? "low" : "high";
+
+    upsertNotificationPreserveRead(
+      review.id, "review", prUrl, owner, repo, number, pr.title,
+      user, review.body || "", null, null, null,
+      review.state || "", priority, review.submitted_at || ""
+    );
+    console.log("[webhook] Upserted review notification", review.id);
+    broadcastNotificationList();
+  }
+
+  if (event === "pull_request_review_comment") {
+    const comment = payload.comment;
+    const pr = payload.pull_request;
+    if (!comment || !pr) return;
+    const owner = payload.repository?.owner?.login || "";
+    const repo = payload.repository?.name || "";
+    const number = pr.number;
+    const prUrl = `https://github.com/${owner}/${repo}/pull/${number}`;
+    const user = comment.user?.login || "";
+    const priority = isBotUser(user) ? "low" : "high";
+
+    upsertNotificationPreserveRead(
+      comment.id, "review_comment", prUrl, owner, repo, number, pr.title,
+      user, comment.body || "", comment.path || "", comment.original_line || comment.line || null,
+      comment.diff_hunk || "", null, priority, comment.created_at || ""
+    );
+    console.log("[webhook] Upserted review_comment notification", comment.id);
+    broadcastNotificationList();
+  }
+
+  if (event === "issue_comment") {
+    // Only process comments on PRs
+    if (!payload.issue?.pull_request) return;
+    const comment = payload.comment;
+    if (!comment) return;
+    const owner = payload.repository?.owner?.login || "";
+    const repo = payload.repository?.name || "";
+    const number = payload.issue.number;
+    const prUrl = `https://github.com/${owner}/${repo}/pull/${number}`;
+    const user = comment.user?.login || "";
+    const priority = isBotUser(user) ? "low" : "high";
+
+    upsertNotificationPreserveRead(
+      comment.id, "issue_comment", prUrl, owner, repo, number, payload.issue.title || "",
+      user, comment.body || "", null, null, null,
+      null, priority, comment.created_at || ""
+    );
+    console.log("[webhook] Upserted issue_comment notification", comment.id);
+    broadcastNotificationList();
+  }
+}
+
 // --- PR API ---
 
 app.get("/api/prs", (req, res) => {
@@ -1151,12 +1379,62 @@ app.get("/api/prs/:owner/:repo/:number/comments", async (req, res) => {
 // --- Notification read state (in-memory) ---
 const readNotifications = new Set();
 
+// --- SSE Endpoint ---
+app.get("/api/events", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // for nginx proxies
+  if (res.flushHeaders) res.flushHeaders();
+
+  const client = {
+    res,
+    heartbeat: setInterval(() => {
+      try { res.write(": heartbeat\n\n"); } catch {}
+    }, SSE_HEARTBEAT_MS)
+  };
+  sseClients.add(client);
+
+  // Send initial counts
+  try {
+    const prCount = getPRRows().length;
+    const notifCount = getNotificationRows().length;
+    res.write(`data: ${JSON.stringify({ type: "counts", data: { prs: prCount, notifications: notifCount } })}\n\n`);
+  } catch {}
+
+  req.on("close", () => {
+    clearInterval(client.heartbeat);
+    sseClients.delete(client);
+  });
+});
+
+// --- GitHub Webhook Endpoint (MUST be before express.json() for raw body signature verification) ---
+app.post("/webhooks/github", express.raw({ type: "application/json" }), async (req, res) => {
+  try {
+    const signature = req.get("x-hub-signature-256") || "";
+    const expected = "sha256=" + crypto.createHmac("sha256", GITHUB_WEBHOOK_SECRET).update(req.body).digest("hex");
+    if (signature.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+      console.warn("[webhook] Invalid signature");
+      return res.status(401).json({ error: "invalid signature" });
+    }
+    const event = req.get("x-github-event");
+    const payload = JSON.parse(req.body.toString("utf8"));
+    // Process asynchronously so we respond quickly
+    handleGitHubWebhook(event, payload).catch(err => console.error("[webhook] Handler error:", err.message));
+    res.status(202).json({ ok: true });
+  } catch (err) {
+    console.error("[webhook] Error:", err.message);
+    res.status(400).json({ error: "invalid payload" });
+  }
+});
+
 app.use(express.json());
 
 app.post("/api/notifications/:id/read", (req, res) => {
   const id = req.params.id;
   try {
     db.prepare("UPDATE notifications SET read = 1 WHERE id = ?").run(id);
+    broadcastNotificationList();
     res.json({ success: true, id });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1167,6 +1445,7 @@ app.post("/api/notifications/:id/unread", (req, res) => {
   const id = req.params.id;
   try {
     db.prepare("UPDATE notifications SET read = 0 WHERE id = ?").run(id);
+    broadcastNotificationList();
     res.json({ success: true, id });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1176,6 +1455,7 @@ app.post("/api/notifications/:id/unread", (req, res) => {
 app.post("/api/notifications/read-all", (_req, res) => {
   try {
     const result = db.prepare("UPDATE notifications SET read = 1 WHERE read = 0").run();
+    broadcastNotificationList();
     res.json({ success: true, count: result.changes });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1188,6 +1468,16 @@ app.post("/api/notifications/refresh", async (_req, res) => {
     // Trigger refresh in background
     triggerNotificationRefresh().catch(err => console.error("[api] Notification refresh failed:", err.message));
     res.json({ success: true, message: "Notification refresh triggered" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/prs/refresh", async (_req, res) => {
+  try {
+    console.log("[api] Manual PR refresh triggered");
+    triggerBackgroundRefresh().catch(err => console.error("[api] PR refresh failed:", err.message));
+    res.json({ success: true, message: "PR refresh triggered" });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1240,6 +1530,7 @@ async function triggerBackgroundRefresh() {
       }
     }
     console.log("[bg] PR refresh complete");
+    broadcastPRList();
     // Trigger notification refresh immediately after PR refresh to capture comments on new PRs
     triggerNotificationRefresh().catch(err => console.error("[bg] Failed to trigger notification refresh:", err.message));
   } catch (err) {
@@ -1281,18 +1572,22 @@ async function triggerNotificationRefresh() {
       }
     }
     console.log("[bg-notif] Done. Inserted", inserted, "new notifications");
+    if (inserted > 0) broadcastNotificationList();
   } catch (err) {
     console.error("[bg-notif] Refresh error:", err.message);
   }
 }
 
-// Run PR refresh every 5 minutes + on startup
+// Startup reconciliation: PR refresh once at startup, then safety net every 30 minutes
+// (Webhooks handle real-time updates; this is only a fallback for missed events)
 setTimeout(() => triggerBackgroundRefresh().catch(console.error), 5000);
-setInterval(() => triggerBackgroundRefresh().catch(console.error), 300000); // 5 min
+setInterval(() => {
+  console.log("[safety] Running 30-minute safety reconciliation refresh");
+  triggerBackgroundRefresh().catch(console.error);
+}, SAFETY_REFRESH_MS); // 30 min
 
-// Run notification refresh 30s after startup (after PR refresh), then every 2 minutes
+// Notification refresh: once after startup PR refresh, then part of the 30-minute cycle
 setTimeout(() => triggerNotificationRefresh().catch(console.error), 30000);
-setInterval(() => triggerNotificationRefresh().catch(console.error), 120000); // 2 min
 
 // --- Settings API ---
 const OPENCLAW_CONFIG_PATH = path.join(os.homedir(), ".openclaw", "openclaw.json");
@@ -1564,9 +1859,127 @@ app.post("/api/prs/fetch", express.json(), async (req, res) => {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(...insertArgs);
     
     console.log("[api] PR", url, "fetched and stored");
+    broadcastPRList();
     res.json({ ok: true, title: ghData.title, state });
   } catch (err) {
     console.error("[api] PR fetch error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Webhook Setup/Status/Test Endpoints ---
+
+app.get("/api/webhooks/status", async (_req, res) => {
+  try {
+    // Get distinct repos from PRs table
+    const repos = db.prepare("SELECT DISTINCT owner, repo FROM prs").all();
+    const results = [];
+    for (const r of repos) {
+      try {
+        const raw = await ghExec(["api", `repos/${r.owner}/${r.repo}/hooks`, "--paginate"], 20000);
+        const hooks = JSON.parse(raw);
+        const dashboardHook = hooks.find(h =>
+          h.config?.url?.includes("/webhooks/github") && h.active
+        );
+        results.push({
+          owner: r.owner, repo: r.repo,
+          configured: !!dashboardHook,
+          hookId: dashboardHook?.id || null,
+          hookUrl: dashboardHook?.config?.url || null,
+          events: dashboardHook?.events || []
+        });
+      } catch (err) {
+        results.push({
+          owner: r.owner, repo: r.repo,
+          configured: false, error: err.message
+        });
+      }
+    }
+    res.json({
+      webhookSecret: GITHUB_WEBHOOK_SECRET,
+      publicUrl: PUBLIC_BASE_URL || null,
+      repos: results
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/webhooks/setup", async (req, res) => {
+  try {
+    const { owner, repo } = req.body;
+    if (!owner || !repo) return res.status(400).json({ error: "owner and repo required" });
+
+    // Determine base URL
+    let baseUrl = PUBLIC_BASE_URL;
+    if (!baseUrl) {
+      baseUrl = req.protocol + "://" + req.get("host");
+    }
+
+    // Check if URL is localhost/private
+    const urlObj = new URL(baseUrl);
+    const hostname = urlObj.hostname;
+    if (hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1" ||
+        hostname.startsWith("192.168.") || hostname.startsWith("10.") || hostname.startsWith("172.")) {
+      return res.json({
+        success: false,
+        message: "Server URL appears to be a local/private address. GitHub cannot reach it.",
+        instructions: [
+          "Set OPENCLAW_PUBLIC_URL environment variable to your public URL",
+          "Or use a tunnel service (ngrok, cloudflared, etc.)",
+          `Example: OPENCLAW_PUBLIC_URL=https://your-domain.com node server.js`,
+          `Then configure the webhook manually at https://github.com/${owner}/${repo}/settings/hooks`,
+          `Webhook URL: ${baseUrl}/webhooks/github`,
+          `Secret: ${GITHUB_WEBHOOK_SECRET}`,
+          `Events: pull_request, pull_request_review, pull_request_review_comment, issue_comment`
+        ]
+      });
+    }
+
+    const webhookUrl = baseUrl + "/webhooks/github";
+
+    // Check for existing webhook
+    try {
+      const raw = await ghExec(["api", `repos/${owner}/${repo}/hooks`, "--paginate"], 20000);
+      const hooks = JSON.parse(raw);
+      const existing = hooks.find(h => h.config?.url === webhookUrl);
+      if (existing) {
+        return res.json({ success: true, message: "Webhook already configured", hookId: existing.id, webhookUrl });
+      }
+    } catch {}
+
+    // Register webhook
+    const result = await ghExec([
+      "api", `repos/${owner}/${repo}/hooks`,
+      "-X", "POST",
+      "-f", "name=web",
+      "-f", `config[url]=${webhookUrl}`,
+      "-f", "config[content_type]=json",
+      "-f", `config[secret]=${GITHUB_WEBHOOK_SECRET}`,
+      "-f", "events[]=pull_request",
+      "-f", "events[]=pull_request_review",
+      "-f", "events[]=pull_request_review_comment",
+      "-f", "events[]=issue_comment",
+      "-f", "active=true"
+    ], 20000);
+    const hook = JSON.parse(result);
+    console.log("[webhook-setup] Registered webhook for", owner + "/" + repo, "id:", hook.id);
+    res.json({ success: true, message: "Webhook registered", hookId: hook.id, webhookUrl });
+  } catch (err) {
+    console.error("[webhook-setup] Error:", err.message);
+    res.status(500).json({
+      error: "Failed to register webhook: " + err.message,
+      hint: "Ensure you have admin access to the repository"
+    });
+  }
+});
+
+app.post("/api/webhooks/test", async (req, res) => {
+  try {
+    // Send a test event to all SSE clients
+    broadcastEvent("test", { message: "Test webhook event", timestamp: new Date().toISOString() });
+    res.json({ success: true, message: "Test event broadcast to " + sseClients.size + " connected clients" });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
@@ -3028,6 +3441,71 @@ button, a, .filter-btn, .main-tab, .session-card, .pr-card, .notif-card {
   .settings-section-body { padding: 12px 10px; }
   .container { padding: 6px 6px; }
 }
+
+/* Live indicator */
+.live-indicator {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11px; font-weight: 500; padding: 3px 10px;
+  border-radius: 12px; margin-left: 8px;
+  transition: all 0.3s;
+}
+.live-indicator.connected {
+  color: var(--completed); background: rgba(166,227,161,0.1);
+}
+.live-indicator.disconnected {
+  color: var(--failed); background: rgba(243,139,168,0.1);
+}
+.live-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  display: inline-block;
+}
+.live-indicator.connected .live-dot {
+  background: var(--completed); animation: pulse-dot 2s infinite;
+}
+.live-indicator.disconnected .live-dot {
+  background: var(--failed);
+}
+
+/* Refresh buttons */
+.refresh-btn {
+  background: var(--card-bg); border: 1px solid var(--border); color: var(--text-primary);
+  padding: 5px 14px; border-radius: 2px; cursor: pointer; font-size: 12px;
+  font-family: 'Inter', system-ui, sans-serif; font-weight: 500;
+  transition: border-color 0.15s, opacity 0.15s;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.refresh-btn:hover { border-color: var(--accent); }
+.refresh-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.refresh-btn.refreshing { opacity: 0.6; }
+
+/* Webhook settings */
+.webhook-repo-row {
+  display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 2px;
+  margin-bottom: 6px;
+}
+.webhook-repo-name {
+  font-family: var(--mono); font-size: 13px; color: var(--text-primary); flex: 1;
+}
+.webhook-status-badge {
+  font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 2px;
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+.webhook-status-badge.active { color: var(--completed); background: rgba(166,227,161,0.12); }
+.webhook-status-badge.inactive { color: var(--text-muted); background: var(--surface); }
+.webhook-setup-btn {
+  padding: 4px 12px; border-radius: 2px; font-size: 11px; font-weight: 600;
+  font-family: 'Inter', system-ui, sans-serif; cursor: pointer;
+  background: var(--accent); color: var(--bg); border: none;
+  transition: opacity 0.15s;
+}
+.webhook-setup-btn:hover { opacity: 0.9; }
+.webhook-setup-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.webhook-info-box {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 2px;
+  padding: 12px 16px; font-family: var(--mono); font-size: 12px;
+  color: var(--text-secondary); word-break: break-all; line-height: 1.6;
+}
 </style>
 </head>
 <body>
@@ -3048,6 +3526,7 @@ button, a, .filter-btn, .main-tab, .session-card, .pr-card, .notif-card {
     <span class="stat-item">
       <span class="stat-value cost" id="total-cost">$0.00</span> total
     </span>
+    <span class="live-indicator disconnected" id="live-indicator"><span class="live-dot"></span> <span id="live-status-text">Connecting...</span></span>
     <button class="theme-toggle" id="theme-toggle" title="Toggle light/dark mode" aria-label="Toggle theme">&#x1f319;</button>
   </div>
 </div>
@@ -3077,7 +3556,10 @@ button, a, .filter-btn, .main-tab, .session-card, .pr-card, .notif-card {
   </div>
 
   <div class="pr-view" id="prs-view">
-    <div class="pr-summary" id="pr-summary"></div>
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:16px">
+      <div class="pr-summary" id="pr-summary" style="margin-bottom:0"></div>
+      <button class="refresh-btn" id="pr-refresh-btn" onclick="manualRefreshPRs()">&#x1f504; Refresh PRs</button>
+    </div>
     <div class="pr-filter-bar" id="pr-filter-bar">
       <button class="filter-btn active" data-pr-filter="all">All</button>
       <button class="filter-btn" data-pr-filter="open">Open</button>
@@ -3089,7 +3571,13 @@ button, a, .filter-btn, .main-tab, .session-card, .pr-card, .notif-card {
   </div>
 
   <div class="notifications-view" id="notifications-view">
-    <div class="notif-summary" id="notif-summary"></div>
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:16px">
+      <div class="notif-summary" id="notif-summary" style="margin-bottom:0"></div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="refresh-btn" id="notif-refresh-btn" onclick="manualRefreshNotifications()">&#x1f504; Refresh</button>
+        <button class="refresh-btn" onclick="markAllNotificationsRead()">&#x2705; Mark All Read</button>
+      </div>
+    </div>
     <div class="notif-filter-bar" id="notif-filter-bar">
       <button class="filter-btn active" data-notif-filter="all">All</button>
       <button class="filter-btn" data-notif-filter="high">High Priority</button>
@@ -3233,6 +3721,41 @@ button, a, .filter-btn, .main-tab, .session-card, .pr-card, .notif-card {
               <!-- Populated by JS -->
             </div>
             <button class="channel-add-btn" onclick="addAgentChannel()">+ Add Channel Mapping</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Webhooks & Live Updates -->
+      <div class="settings-section">
+        <div class="settings-section-header">&#x1f517; Webhooks &amp; Live Updates</div>
+        <div class="settings-section-body">
+          <div class="settings-field">
+            <label class="settings-label">SSE Connection</label>
+            <div class="settings-field-row">
+              <span class="settings-status-dot" id="settings-sse-dot"></span>
+              <span id="settings-sse-text" style="font-size:12px;font-family:var(--mono)">Checking...</span>
+            </div>
+            <span class="settings-hint">Server-Sent Events connection for real-time updates</span>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Webhook URL</label>
+            <div class="webhook-info-box" id="settings-webhook-url">Loading...</div>
+            <span class="settings-hint">Configure this URL in your GitHub repository webhook settings</span>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Webhook Secret</label>
+            <div class="webhook-info-box" id="settings-webhook-secret">Loading...</div>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label">Repository Webhooks</label>
+            <div id="settings-webhook-repos">Loading webhook status...</div>
+            <span class="settings-hint">Shows which repositories have the dashboard webhook configured</span>
+          </div>
+          <div class="settings-field">
+            <div class="settings-field-row" style="gap:8px">
+              <button class="settings-btn settings-btn-secondary" onclick="refreshWebhookStatus()">&#x1f504; Refresh Status</button>
+              <button class="settings-btn settings-btn-secondary" onclick="testWebhook()">&#x1f9ea; Test SSE</button>
+            </div>
           </div>
         </div>
       </div>
@@ -4156,8 +4679,8 @@ function fetchPreviews() {
 
 fetchSessions();
 setInterval(fetchSessions, 5000);
-setInterval(fetchPRs, 30000);
-setInterval(fetchNotifications, 120000);
+// PR and notification polling removed — SSE handles live updates now
+// Manual refresh buttons and initial page load still use fetchPRs/fetchNotifications
 
 // Re-fetch output for running sessions periodically
 setInterval(() => {
@@ -4216,8 +4739,9 @@ function switchMainTab(tab) {
   if (tab === "notifications" && notifications.length === 0 && !notifFetchInProgress) {
     fetchNotifications();
   }
-  if (tab === "settings" && !settingsLoaded) {
-    fetchSettings();
+  if (tab === "settings") {
+    if (!settingsLoaded) fetchSettings();
+    refreshWebhookStatus();
   }
 }
 
@@ -4427,10 +4951,7 @@ function goToSession(sessionId) {
   }
 }
 
-// PR auto-refresh every 30s
-setInterval(() => {
-  if (mainTab === "prs") fetchPRs();
-}, 30000);
+// PR polling removed — SSE handles live updates now
 
 // --- Notifications Tab ---
 let notifications = [];
@@ -4484,6 +5005,7 @@ function renderNotifications() {
   else if (notifFilter === "low") filtered = notifications.filter(n => n.priority === "low");
   else if (notifFilter === "review") filtered = notifications.filter(n => n.type === "review");
   else if (notifFilter === "comment") filtered = notifications.filter(n => n.type === "review_comment" || n.type === "issue_comment");
+  else if (notifFilter === "unread") filtered = notifications.filter(n => !n.read);
 
   if (filtered.length === 0) {
     list.innerHTML = '<div class="empty-state"><div class="icon">\\u{1f514}</div>'
@@ -4562,10 +5084,7 @@ function toggleNotifDiff(idx) {
   }
 }
 
-// Notifications auto-refresh every 2 minutes
-setInterval(() => {
-  if (mainTab === "notifications") fetchNotifications();
-}, 120000);
+// Notifications polling removed — SSE handles live updates now
 
 // --- Settings Tab ---
 let settingsLoaded = false;
@@ -4872,6 +5391,234 @@ async function refreshToken() {
   }
 }
 
+// --- SSE (Server-Sent Events) Connection ---
+let eventSource = null;
+let sseConnected = false;
+
+function setLiveStatus(connected) {
+  sseConnected = connected;
+  const indicator = document.getElementById("live-indicator");
+  const text = document.getElementById("live-status-text");
+  if (indicator) {
+    indicator.className = "live-indicator " + (connected ? "connected" : "disconnected");
+  }
+  if (text) {
+    text.textContent = connected ? "Live" : "Disconnected";
+  }
+  // Update settings SSE status if visible
+  const sseDot = document.getElementById("settings-sse-dot");
+  const sseText = document.getElementById("settings-sse-text");
+  if (sseDot) sseDot.className = "settings-status-dot " + (connected ? "active" : "inactive");
+  if (sseText) {
+    sseText.textContent = connected ? "Connected" : "Disconnected";
+    sseText.style.color = connected ? "var(--completed)" : "var(--failed)";
+  }
+}
+
+function connectEvents() {
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
+  eventSource = new EventSource("/api/events");
+
+  eventSource.onopen = function() {
+    console.log("[sse] Connected");
+    setLiveStatus(true);
+  };
+
+  eventSource.onerror = function() {
+    console.log("[sse] Connection error/closed");
+    setLiveStatus(false);
+    // EventSource will auto-reconnect
+  };
+
+  eventSource.onmessage = function(evt) {
+    try {
+      var msg = JSON.parse(evt.data);
+
+      if (msg.type === "pr-list") {
+        prs = msg.data;
+        renderPRSummary();
+        renderPRs();
+        document.getElementById("prs-tab-count").textContent = prs.length;
+      }
+
+      if (msg.type === "notification-list") {
+        notifications = msg.data;
+        renderNotifSummary();
+        renderNotifications();
+        document.getElementById("notifications-tab-count").textContent = notifications.length;
+      }
+
+      if (msg.type === "pr-update") {
+        // Single PR update: upsert into local array
+        var updated = msg.data;
+        var idx = prs.findIndex(function(p) { return p.url === updated.url; });
+        if (idx >= 0) {
+          prs[idx] = updated;
+        } else {
+          prs.unshift(updated);
+        }
+        renderPRSummary();
+        renderPRs();
+        document.getElementById("prs-tab-count").textContent = prs.length;
+      }
+
+      if (msg.type === "notification-update") {
+        var notif = msg.data;
+        var nIdx = notifications.findIndex(function(n) { return n.id === notif.id; });
+        if (nIdx >= 0) {
+          notifications[nIdx] = notif;
+        } else {
+          notifications.unshift(notif);
+        }
+        renderNotifSummary();
+        renderNotifications();
+        document.getElementById("notifications-tab-count").textContent = notifications.length;
+      }
+
+      if (msg.type === "counts") {
+        document.getElementById("prs-tab-count").textContent = msg.data.prs;
+        document.getElementById("notifications-tab-count").textContent = msg.data.notifications;
+      }
+
+      if (msg.type === "test") {
+        showToast("SSE test event received: " + (msg.data.message || "OK"), "success");
+      }
+    } catch (err) {
+      console.error("[sse] Parse error:", err);
+    }
+  };
+}
+
+// --- Manual Refresh Functions ---
+async function manualRefreshPRs() {
+  var btn = document.getElementById("pr-refresh-btn");
+  if (btn) { btn.disabled = true; btn.classList.add("refreshing"); btn.innerHTML = "\\u23f3 Refreshing..."; }
+  try {
+    await fetch("/api/prs/refresh", { method: "POST" });
+    // Wait a moment for background refresh to complete, then fetch
+    setTimeout(async function() {
+      await fetchPRs();
+      showToast("PRs refreshed", "success");
+    }, 2000);
+  } catch (err) {
+    showToast("PR refresh failed: " + err.message, "error");
+  } finally {
+    setTimeout(function() {
+      if (btn) { btn.disabled = false; btn.classList.remove("refreshing"); btn.innerHTML = "\\u{1f504} Refresh PRs"; }
+    }, 3000);
+  }
+}
+
+async function manualRefreshNotifications() {
+  var btn = document.getElementById("notif-refresh-btn");
+  if (btn) { btn.disabled = true; btn.classList.add("refreshing"); btn.innerHTML = "\\u23f3 Refreshing..."; }
+  try {
+    await fetch("/api/notifications/refresh", { method: "POST" });
+    setTimeout(async function() {
+      await fetchNotifications();
+      showToast("Notifications refreshed", "success");
+    }, 2000);
+  } catch (err) {
+    showToast("Notification refresh failed: " + err.message, "error");
+  } finally {
+    setTimeout(function() {
+      if (btn) { btn.disabled = false; btn.classList.remove("refreshing"); btn.innerHTML = "\\u{1f504} Refresh"; }
+    }, 3000);
+  }
+}
+
+// --- Webhook Settings Functions ---
+async function refreshWebhookStatus() {
+  var reposDiv = document.getElementById("settings-webhook-repos");
+  var urlDiv = document.getElementById("settings-webhook-url");
+  var secretDiv = document.getElementById("settings-webhook-secret");
+  if (reposDiv) reposDiv.innerHTML = "Loading webhook status...";
+
+  try {
+    var res = await fetch("/api/webhooks/status");
+    if (!res.ok) throw new Error("Failed to fetch webhook status");
+    var data = await res.json();
+
+    // Show webhook URL
+    var webhookUrl = (data.publicUrl || window.location.origin) + "/webhooks/github";
+    if (urlDiv) urlDiv.textContent = webhookUrl;
+    if (secretDiv) secretDiv.textContent = data.webhookSecret || "(unknown)";
+
+    // Show repo status
+    if (!data.repos || data.repos.length === 0) {
+      if (reposDiv) reposDiv.innerHTML = '<div style="color:var(--text-muted);font-size:13px">No repositories found in PR database. PRs will appear after the first background refresh.</div>';
+      return;
+    }
+
+    var html = "";
+    for (var i = 0; i < data.repos.length; i++) {
+      var r = data.repos[i];
+      html += '<div class="webhook-repo-row">'
+        + '<span class="webhook-repo-name">' + escHtml(r.owner + "/" + r.repo) + '</span>';
+      if (r.configured) {
+        html += '<span class="webhook-status-badge active">\\u2705 Active</span>';
+      } else {
+        html += '<span class="webhook-status-badge inactive">Not configured</span>'
+          + '<button class="webhook-setup-btn" onclick="setupWebhook(\\'' + escHtml(r.owner) + '\\', \\'' + escHtml(r.repo) + '\\', this)">Setup</button>';
+      }
+      if (r.error) {
+        html += '<span style="font-size:11px;color:var(--text-muted)">' + escHtml(r.error) + '</span>';
+      }
+      html += '</div>';
+    }
+    if (reposDiv) reposDiv.innerHTML = html;
+  } catch (err) {
+    if (reposDiv) reposDiv.innerHTML = '<div style="color:var(--failed);font-size:13px">Error: ' + escHtml(err.message) + '</div>';
+  }
+}
+
+async function setupWebhook(owner, repo, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "Setting up..."; }
+  try {
+    var res = await fetch("/api/webhooks/setup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ owner: owner, repo: repo })
+    });
+    var data = await res.json();
+    if (data.success) {
+      showToast("Webhook configured for " + owner + "/" + repo, "success");
+    } else if (data.instructions) {
+      showToast(data.message, "info");
+      // Show instructions
+      var reposDiv = document.getElementById("settings-webhook-repos");
+      if (reposDiv) {
+        reposDiv.innerHTML += '<div class="webhook-info-box" style="margin-top:10px">'
+          + data.instructions.map(function(line) { return escHtml(line); }).join("<br>")
+          + '</div>';
+      }
+    } else {
+      showToast("Setup failed: " + (data.error || "unknown error"), "error");
+    }
+    // Refresh status
+    refreshWebhookStatus();
+  } catch (err) {
+    showToast("Webhook setup failed: " + err.message, "error");
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Setup"; }
+  }
+}
+
+async function testWebhook() {
+  try {
+    var res = await fetch("/api/webhooks/test", { method: "POST" });
+    var data = await res.json();
+    if (data.success) {
+      showToast(data.message, "success");
+    }
+  } catch (err) {
+    showToast("Test failed: " + err.message, "error");
+  }
+}
+
 // Init
 document.addEventListener("DOMContentLoaded", function() {
   initFromHash();
@@ -4879,6 +5626,8 @@ document.addEventListener("DOMContentLoaded", function() {
   // Fetch PR and notification counts after DOM is ready
   fetchPRs();
   fetchNotifications();
+  // Connect to SSE for live updates
+  connectEvents();
   // Register service worker for PWA/offline support
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("/sw.js").catch(function() {});
