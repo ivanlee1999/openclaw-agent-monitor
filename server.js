@@ -28,7 +28,7 @@ const GITHUB_WEBHOOK_SECRET = (() => {
 })();
 const SSE_HEARTBEAT_MS = 30000;
 const SAFETY_REFRESH_MS = 30 * 60 * 1000; // 30 minutes
-const NOTIFICATION_FALLBACK_MS = 5 * 60 * 1000; // 5 minutes — shorter fallback for notifications
+const NOTIFICATION_FALLBACK_MS = 30 * 60 * 1000; // 30 minutes — webhooks handle real-time
 const PUBLIC_BASE_URL = process.env.OPENCLAW_PUBLIC_URL || "";
 
 const sseClients = new Set();
@@ -1594,7 +1594,15 @@ async function triggerNotificationRefresh() {
 
 // Startup reconciliation: PR refresh once at startup, then safety net every 30 minutes
 // (Webhooks handle real-time updates; this is only a fallback for missed events)
-setTimeout(() => triggerBackgroundRefresh().catch(console.error), 5000);
+// Skip startup refresh if cache is fresh (< 30 min) to avoid API burst on restarts
+const lastPRRefresh = db.prepare("SELECT MAX(fetched_at) as t FROM prs").get()?.t || 0;
+const prCacheAgeMs = Date.now() - lastPRRefresh;
+if (prCacheAgeMs > 1800000) {
+  console.log("[startup] PR cache is", Math.round(prCacheAgeMs / 60000), "min old — refreshing");
+  setTimeout(() => triggerBackgroundRefresh().catch(console.error), 5000);
+} else {
+  console.log("[startup] PR cache is", Math.round(prCacheAgeMs / 60000), "min old — skipping refresh");
+}
 setInterval(() => {
   console.log("[safety] Running 30-minute safety reconciliation refresh");
   triggerBackgroundRefresh().catch(console.error);
@@ -1603,7 +1611,14 @@ setInterval(() => {
 // Notification refresh: once after startup, then every 5 minutes as a fallback
 // (Webhooks handle real-time updates; this shorter interval prevents stale notifications
 // when webhooks are unavailable or events are missed)
-setTimeout(() => triggerNotificationRefresh().catch(console.error), 30000);
+const lastNotifRefresh = db.prepare("SELECT MAX(fetched_at) as t FROM notifications").get()?.t || 0;
+const notifCacheAgeMs = Date.now() - lastNotifRefresh;
+if (notifCacheAgeMs > 1800000) {
+  console.log("[startup] Notification cache is", Math.round(notifCacheAgeMs / 60000), "min old — refreshing");
+  setTimeout(() => triggerNotificationRefresh().catch(console.error), 30000);
+} else {
+  console.log("[startup] Notification cache is", Math.round(notifCacheAgeMs / 60000), "min old — skipping refresh");
+}
 setInterval(() => {
   console.log("[fallback] Running 5-minute notification refresh");
   triggerNotificationRefresh().catch(console.error);
