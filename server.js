@@ -12,9 +12,10 @@ const Database = require("better-sqlite3");
 const { version: appVersion } = require("./package.json");
 
 // --- Webhook & SSE Configuration ---
-const GITHUB_WEBHOOK_SECRET = "openclaw-dashboard-webhook-2026";
+const GITHUB_WEBHOOK_SECRET = process.env.OPENCLAW_WEBHOOK_SECRET || crypto.randomBytes(32).toString("hex");
 const SSE_HEARTBEAT_MS = 30000;
 const SAFETY_REFRESH_MS = 30 * 60 * 1000; // 30 minutes
+const NOTIFICATION_FALLBACK_MS = 5 * 60 * 1000; // 5 minutes — shorter fallback for notifications
 const PUBLIC_BASE_URL = process.env.OPENCLAW_PUBLIC_URL || "";
 
 const sseClients = new Set();
@@ -1586,8 +1587,14 @@ setInterval(() => {
   triggerBackgroundRefresh().catch(console.error);
 }, SAFETY_REFRESH_MS); // 30 min
 
-// Notification refresh: once after startup PR refresh, then part of the 30-minute cycle
+// Notification refresh: once after startup, then every 5 minutes as a fallback
+// (Webhooks handle real-time updates; this shorter interval prevents stale notifications
+// when webhooks are unavailable or events are missed)
 setTimeout(() => triggerNotificationRefresh().catch(console.error), 30000);
+setInterval(() => {
+  console.log("[fallback] Running 5-minute notification refresh");
+  triggerNotificationRefresh().catch(console.error);
+}, NOTIFICATION_FALLBACK_MS);
 
 // --- Settings API ---
 const OPENCLAW_CONFIG_PATH = path.join(os.homedir(), ".openclaw", "openclaw.json");
@@ -1869,7 +1876,18 @@ app.post("/api/prs/fetch", express.json(), async (req, res) => {
 
 // --- Webhook Setup/Status/Test Endpoints ---
 
-app.get("/api/webhooks/status", async (_req, res) => {
+// Guard: only allow webhook admin endpoints from localhost to prevent
+// unauthenticated callers from using the host's GitHub credentials.
+function requireLocalhost(req, res, next) {
+  const addr = req.ip || req.connection?.remoteAddress || "";
+  const isLocal = addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1" || addr === "localhost";
+  if (!isLocal) {
+    return res.status(403).json({ error: "Webhook admin endpoints are only accessible from localhost" });
+  }
+  next();
+}
+
+app.get("/api/webhooks/status", requireLocalhost, async (_req, res) => {
   try {
     // Get distinct repos from PRs table
     const repos = db.prepare("SELECT DISTINCT owner, repo FROM prs").all();
@@ -1896,7 +1914,7 @@ app.get("/api/webhooks/status", async (_req, res) => {
       }
     }
     res.json({
-      webhookSecret: GITHUB_WEBHOOK_SECRET,
+      webhookSecretConfigured: !!process.env.OPENCLAW_WEBHOOK_SECRET,
       publicUrl: PUBLIC_BASE_URL || null,
       repos: results
     });
@@ -1905,7 +1923,7 @@ app.get("/api/webhooks/status", async (_req, res) => {
   }
 });
 
-app.post("/api/webhooks/setup", async (req, res) => {
+app.post("/api/webhooks/setup", requireLocalhost, async (req, res) => {
   try {
     const { owner, repo } = req.body;
     if (!owner || !repo) return res.status(400).json({ error: "owner and repo required" });
@@ -1926,11 +1944,12 @@ app.post("/api/webhooks/setup", async (req, res) => {
         message: "Server URL appears to be a local/private address. GitHub cannot reach it.",
         instructions: [
           "Set OPENCLAW_PUBLIC_URL environment variable to your public URL",
+          "Set OPENCLAW_WEBHOOK_SECRET environment variable to a strong secret",
           "Or use a tunnel service (ngrok, cloudflared, etc.)",
-          `Example: OPENCLAW_PUBLIC_URL=https://your-domain.com node server.js`,
+          `Example: OPENCLAW_PUBLIC_URL=https://your-domain.com OPENCLAW_WEBHOOK_SECRET=your-secret node server.js`,
           `Then configure the webhook manually at https://github.com/${owner}/${repo}/settings/hooks`,
           `Webhook URL: ${baseUrl}/webhooks/github`,
-          `Secret: ${GITHUB_WEBHOOK_SECRET}`,
+          `Secret: (use the value of your OPENCLAW_WEBHOOK_SECRET env var)`,
           `Events: pull_request, pull_request_review, pull_request_review_comment, issue_comment`
         ]
       });
@@ -1974,7 +1993,7 @@ app.post("/api/webhooks/setup", async (req, res) => {
   }
 });
 
-app.post("/api/webhooks/test", async (req, res) => {
+app.post("/api/webhooks/test", requireLocalhost, async (req, res) => {
   try {
     // Send a test event to all SSE clients
     broadcastEvent("test", { message: "Test webhook event", timestamp: new Date().toISOString() });
@@ -3745,6 +3764,7 @@ button, a, .filter-btn, .main-tab, .session-card, .pr-card, .notif-card {
           <div class="settings-field">
             <label class="settings-label">Webhook Secret</label>
             <div class="webhook-info-box" id="settings-webhook-secret">Loading...</div>
+            <span class="settings-hint">Set via OPENCLAW_WEBHOOK_SECRET environment variable (never displayed)</span>
           </div>
           <div class="settings-field">
             <label class="settings-label">Repository Webhooks</label>
@@ -5545,7 +5565,7 @@ async function refreshWebhookStatus() {
     // Show webhook URL
     var webhookUrl = (data.publicUrl || window.location.origin) + "/webhooks/github";
     if (urlDiv) urlDiv.textContent = webhookUrl;
-    if (secretDiv) secretDiv.textContent = data.webhookSecret || "(unknown)";
+    if (secretDiv) secretDiv.textContent = data.webhookSecretConfigured ? "\u2705 Configured via environment variable" : "\u26a0\ufe0f Not configured \u2014 set OPENCLAW_WEBHOOK_SECRET env var";
 
     // Show repo status
     if (!data.repos || data.repos.length === 0) {
