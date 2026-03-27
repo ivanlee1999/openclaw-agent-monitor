@@ -677,8 +677,8 @@ app.get("/api/sessions/:id/diff", async (req, res) => {
     try {
       if (session.createdAt && session.completedAt) {
         // Search for commits in the session's time window
-        const startTime = new Date(session.createdAt * 1000 - 60000).toISOString();
-        const endTime = new Date((session.completedAt || session.createdAt) * 1000 + 60000).toISOString();
+        const startTime = new Date(session.createdAt - 60000).toISOString();
+        const endTime = new Date((session.completedAt || session.createdAt) + 60000).toISOString();
         const { stdout: logOut } = await runGit([
           "log", "--format=%H %aI %s", "--after=" + startTime, "--before=" + endTime, "-20"
         ]);
