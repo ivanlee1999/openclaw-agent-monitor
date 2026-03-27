@@ -2648,7 +2648,6 @@ a:hover { text-decoration: underline; }
 }
 @media (max-width: 1200px) {
   .diff-split-toggle { display: none; }
-  .diff-split-view { display: none; }
 }
 
 /* Tabs */
@@ -4130,6 +4129,20 @@ function setDiffView(mode) {
   if (expandedStageId) renderPipelines();
 }
 
+// Re-render diffs when crossing the 1200px responsive breakpoint
+(function() {
+  var lastWasWide = window.innerWidth > 1200;
+  window.addEventListener("resize", function() {
+    var isWide = window.innerWidth > 1200;
+    if (isWide !== lastWasWide) {
+      lastWasWide = isWide;
+      sessionRenderCache = {};
+      renderSessions();
+      if (expandedStageId) renderPipelines();
+    }
+  });
+})();
+
 function syncDiffScroll(key, side, sourceEl) {
   if (diffScrollSyncState[key]) return;
   var otherId = side === "left" ? "diff-right-" + key : "diff-left-" + key;
@@ -4179,7 +4192,7 @@ function parseUnifiedDiffForSplit(diffText) {
 
     if (line.startsWith("diff --git ")) {
       flushChanges();
-      currentFile = { header: line, oldFile: "", newFile: "", hunks: [] };
+      currentFile = { header: line, oldFile: "", newFile: "", hunks: [], meta: [] };
       files.push(currentFile);
       currentHunk = null;
       continue;
@@ -4188,6 +4201,7 @@ function parseUnifiedDiffForSplit(diffText) {
     if (!currentFile) continue;
 
     if (line.startsWith("index ") || line.startsWith("new file mode") || line.startsWith("deleted file mode") || line.startsWith("old mode") || line.startsWith("new mode") || line.startsWith("similarity index") || line.startsWith("rename from") || line.startsWith("rename to") || line.startsWith("Binary files")) {
+      currentFile.meta.push(line);
       continue;
     }
 
@@ -4256,11 +4270,28 @@ function renderSplitPane(file, side) {
 function getDiffSplitHtml(id) {
   var data = diffCache[id];
   var parsed = parseUnifiedDiffForSplit(data.diff || "");
+
+  // If no files were parsed at all, fall back to unified rendering
+  if (parsed.files.length === 0) {
+    return getUnifiedDiffBodyHtml(data);
+  }
+
   var html = '<div class="diff-split-view">';
   for (var f = 0; f < parsed.files.length; f++) {
     var file = parsed.files[f];
     var fileLabel = file.newFile ? file.newFile.replace(/^\\+\\+\\+ [ab]\\//, "") : file.header;
     html += '<div class="diff-split-file-header">' + escHtml(fileLabel) + '</div>';
+
+    // If file has no hunks but has metadata (binary, rename, mode-only), render metadata
+    if (file.hunks.length === 0 && file.meta.length > 0) {
+      html += '<div class="diff-split-meta">';
+      for (var m = 0; m < file.meta.length; m++) {
+        html += escHtml(file.meta[m]) + '<br>';
+      }
+      html += '</div>';
+      continue;
+    }
+
     var key = id + "-" + f;
     html += '<div class="diff-split-grid">';
     html += '<div class="diff-split-pane diff-split-pane-left" id="diff-left-' + key + '" onscroll="syncDiffScroll(\\'' + key + '\\', \\'left\\', this)">';
