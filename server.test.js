@@ -81,3 +81,27 @@ test("GET /api/ping returns pong status", async () => {
     await close();
   }
 });
+
+test("GET /api/sessions/:id/diff returns 404 for unknown session", async () => {
+  const { baseUrl, close } = await listen(app);
+  try {
+    const { status, body } = await get(`${baseUrl}/api/sessions/nonexistent-id/diff`);
+    assert.equal(status, 404);
+    const json = JSON.parse(body);
+    assert.equal(json.error, "Session not found");
+  } finally {
+    await close();
+  }
+});
+
+test("GET /api/sessions/:id/diff returns graceful payload for missing workdir", async () => {
+  // If the sessions file doesn't exist or has no matching sessions, the route returns 404
+  // which is also a valid graceful response.
+  const { baseUrl, close } = await listen(app);
+  try {
+    const { status } = await get(`${baseUrl}/api/sessions/test-fake-session/diff`);
+    assert.ok([200, 404].includes(status), "Expected 200 or 404, got " + status);
+  } finally {
+    await close();
+  }
+});

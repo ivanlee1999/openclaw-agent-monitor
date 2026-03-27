@@ -637,6 +637,132 @@ app.get("/api/sessions/:id/history", async (req, res) => {
   }
 });
 
+// --- Session Diff API ---
+
+app.get("/api/sessions/:id/diff", async (req, res) => {
+  try {
+    const sessions = readSessions();
+    const session = sessions.find((s) => s.sessionId === req.params.id);
+    if (!session) {
+      return res.status(404).json({ error: "Session not found" });
+    }
+
+    // Short-circuit for planning/review stages
+    const name = (session.name || session.harness || "").toLowerCase();
+    if (/codex-plan|codex-review/.test(name)) {
+      return res.json({ available: false, reason: "No code changes (planning/review stage)" });
+    }
+
+    const workdir = session.workdir;
+    if (!workdir || !fs.existsSync(workdir)) {
+      return res.json({ available: false, reason: "Working directory not found" });
+    }
+
+    // Check if it's a git repo
+    const gitDir = path.join(workdir, ".git");
+    if (!fs.existsSync(gitDir)) {
+      return res.json({ available: false, reason: "Not a git repository" });
+    }
+
+    const runGit = (args) =>
+      execFileAsync("git", args, {
+        cwd: workdir,
+        encoding: "utf-8",
+        timeout: 15000,
+        maxBuffer: 5 * 1024 * 1024,
+      });
+
+    // Try to find a commit matching the session time window
+    let commitSha = null;
+    try {
+      if (session.createdAt && session.completedAt) {
+        // Search for commits in the session's time window
+        const startTime = new Date(session.createdAt * 1000 - 60000).toISOString();
+        const endTime = new Date((session.completedAt || session.createdAt) * 1000 + 60000).toISOString();
+        const { stdout: logOut } = await runGit([
+          "log", "--format=%H %aI %s", "--after=" + startTime, "--before=" + endTime, "-20"
+        ]);
+        const lines = logOut.trim().split("\n").filter(Boolean);
+        if (lines.length > 0) {
+          // Use the most recent commit in the window
+          commitSha = lines[0].split(" ")[0];
+        }
+      }
+    } catch {
+      // Ignore log errors, fall through to HEAD
+    }
+
+    // Fallback: use HEAD
+    if (!commitSha) {
+      try {
+        const { stdout: headOut } = await runGit(["rev-parse", "HEAD"]);
+        commitSha = headOut.trim();
+      } catch {
+        return res.json({ available: false, reason: "No commits found" });
+      }
+    }
+
+    // Check if there is a parent commit
+    let hasParent = true;
+    try {
+      await runGit(["rev-parse", commitSha + "~1"]);
+    } catch {
+      hasParent = false;
+    }
+
+    if (!hasParent) {
+      // Single commit — show the full initial commit diff
+      try {
+        const { stdout: stat } = await runGit(["show", "--stat", "--format=", commitSha]);
+        const { stdout: diff } = await runGit(["show", "--format=", commitSha]);
+        const { stdout: info } = await runGit(["log", "-1", "--format=%H%n%s%n%aI", commitSha]);
+        const [sha, subject, authorDate] = info.trim().split("\n");
+        const summaryMatch = stat.trim().match(/(\d+ files? changed.*)/);
+        return res.json({
+          available: true,
+          reason: null,
+          mode: "commit",
+          commit: { sha, subject, authorDate },
+          summary: summaryMatch ? summaryMatch[1] : "",
+          stat: stat.trim(),
+          diff: diff,
+        });
+      } catch {
+        return res.json({ available: false, reason: "Failed to read commit diff" });
+      }
+    }
+
+    // Normal case: diff against parent
+    try {
+      const { stdout: stat } = await runGit(["diff", "--stat", commitSha + "~1", commitSha]);
+      const { stdout: diff } = await runGit(["diff", commitSha + "~1", commitSha]);
+      const { stdout: info } = await runGit(["log", "-1", "--format=%H%n%s%n%aI", commitSha]);
+      const [sha, subject, authorDate] = info.trim().split("\n");
+
+      if (!diff.trim()) {
+        return res.json({ available: false, reason: "No code changes detected" });
+      }
+
+      const summaryMatch = stat.trim().match(/(\d+ files? changed.*)/);
+      return res.json({
+        available: true,
+        reason: null,
+        mode: "commit",
+        commit: { sha, subject, authorDate },
+        summary: summaryMatch ? summaryMatch[1] : "",
+        stat: stat.trim(),
+        diff: diff,
+      });
+    } catch (gitErr) {
+      console.error("Git diff error:", gitErr.message);
+      return res.json({ available: false, reason: "Failed to read diff" });
+    }
+  } catch (err) {
+    console.error("Error reading session diff:", err.message);
+    res.status(500).json({ error: "Failed to read session diff" });
+  }
+});
+
 // --- Latest activity API (lightweight, also cached) ---
 
 app.get("/api/sessions/:id/latest", async (req, res) => {
@@ -2452,6 +2578,27 @@ a:hover { text-decoration: underline; }
 .output-loading { color: var(--text-muted); font-style: italic; padding: 20px 0; }
 .output-error { color: var(--failed); padding: 20px 0; }
 
+/* Diff viewer */
+.diff-summary {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 2px;
+  padding: 10px 14px; margin-bottom: 12px; font-size: 12px; color: var(--text-secondary);
+  font-family: var(--mono);
+}
+.diff-summary-title { font-weight: 600; margin-bottom: 6px; color: var(--text-heading); }
+.diff-commit-info { font-size: 11px; color: var(--text-muted); margin-bottom: 8px; }
+.diff-commit-info code { background: var(--card-bg); padding: 1px 5px; border-radius: 2px; }
+.diff-pre {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 2px;
+  padding: 0; overflow-x: auto; font-family: var(--mono); font-size: 12px;
+  line-height: 1.6; max-height: 600px; overflow-y: auto; white-space: pre;
+  color: var(--text-primary);
+}
+.diff-line { display: block; padding: 0 14px; min-height: 1.6em; }
+.diff-line-add { background: rgba(166,227,161, 0.15); }
+.diff-line-del { background: rgba(243,139,168, 0.15); }
+.diff-line-hunk { color: var(--text-muted); background: rgba(137,180,250, 0.08); }
+.diff-line-file { font-weight: 700; }
+
 /* Tabs */
 .tab-bar {
   display: flex; gap: 0; margin-bottom: 16px; border-bottom: 1px solid var(--border);
@@ -3896,6 +4043,8 @@ let expandedPipelineId = null;
 let expandedStageId = null;
 let outputCache = {};
 let historyCache = {};
+let diffCache = {};
+let diffFetchInFlight = {};
 let activeTab = {};
 let previewCache = {};
 let timelineOrder = {};
@@ -4100,6 +4249,7 @@ function getSessionRenderKey(s) {
     preview: previewCache[s.sessionId] || null,
     output: expandedId === s.sessionId ? (outputCache[s.sessionId] || null) : "__collapsed__",
     history: expandedId === s.sessionId ? (historyCache[s.sessionId] || null) : "__collapsed__",
+    diff: (expandedId === s.sessionId || expandedStageId === s.sessionId) ? (diffCache[s.sessionId] || null) : "__collapsed__",
     order: timelineOrder[s.sessionId] || "newest"
   });
 }
@@ -4402,10 +4552,13 @@ function getOutputHtml(id) {
   let tabBar = '<div class="tab-bar">'
     + '<button class="tab-btn' + (tab === "timeline" ? " active" : "") + '" onclick="switchTab(\\'' + id + '\\', \\'timeline\\')">&#x1f4cb; Timeline</button>'
     + '<button class="tab-btn' + (tab === "raw" ? " active" : "") + '" onclick="switchTab(\\'' + id + '\\', \\'raw\\')">&#x1f4c4; Raw Output</button>'
+    + '<button class="tab-btn' + (tab === "diff" ? " active" : "") + '" onclick="switchTab(\\'' + id + '\\', \\'diff\\')">&#x1f4bb; Diff</button>'
     + '</div>';
 
   if (tab === "timeline") {
     return tabBar + getTimelineHtml(id);
+  } else if (tab === "diff") {
+    return tabBar + getDiffHtml(id);
   } else {
     return tabBar + getRawOutputHtml(id);
   }
@@ -4585,6 +4738,9 @@ function switchTab(id, tab) {
       .then(data => { historyCache[id] = data; if (expandedId === id) renderSessions(); if (expandedStageId === id) renderPipelines(); })
       .catch(() => { historyCache[id] = null; if (expandedId === id) renderSessions(); if (expandedStageId === id) renderPipelines(); });
   }
+  if (tab === "diff") {
+    ensureDiffLoaded(id);
+  }
   renderSessions();
   if (expandedStageId === id) renderPipelines();
 }
@@ -4626,6 +4782,77 @@ function copyOutput(id) {
   if (outputCache[id]) {
     navigator.clipboard.writeText(outputCache[id]).catch(() => {});
   }
+}
+
+function copyDiff(id) {
+  const data = diffCache[id];
+  if (data && data.diff) {
+    navigator.clipboard.writeText(data.diff).catch(() => {});
+  }
+}
+
+function ensureDiffLoaded(id) {
+  if (diffCache[id] !== undefined || diffFetchInFlight[id]) return;
+  diffFetchInFlight[id] = true;
+  fetch("/api/sessions/" + encodeURIComponent(id) + "/diff")
+    .then(function(r) { return r.ok ? r.json() : { available: false, reason: "Failed to load diff" }; })
+    .then(function(data) { diffCache[id] = data; })
+    .catch(function() { diffCache[id] = { available: false, reason: "Failed to load diff" }; })
+    .finally(function() {
+      delete diffFetchInFlight[id];
+      if (expandedId === id) renderSessions();
+      if (expandedStageId === id) renderPipelines();
+    });
+}
+
+function getDiffHtml(id) {
+  const data = diffCache[id];
+  if (data === undefined) return '<p class="output-loading">Loading diff...</p>';
+  if (!data || !data.available) {
+    return '<p class="output-error">' + escHtml((data && data.reason) || "No code changes detected") + '</p>';
+  }
+  let html = '<div class="output-actions">'
+    + '<span style="font-size:12px;color:var(--text-muted)">Code changes</span>'
+    + '<button onclick="copyDiff(\\'' + id + '\\')">&#x1f4cb; Copy diff</button></div>';
+
+  // Commit info
+  if (data.commit) {
+    html += '<div class="diff-commit-info">Commit <code>' + escHtml((data.commit.sha || "").slice(0, 8)) + '</code>'
+      + (data.commit.subject ? ' — ' + escHtml(data.commit.subject) : '')
+      + '</div>';
+  }
+
+  // Stat summary
+  if (data.stat) {
+    html += '<div class="diff-summary">';
+    if (data.summary) {
+      html += '<div class="diff-summary-title">' + escHtml(data.summary) + '</div>';
+    }
+    html += escHtml(data.stat.replace(/\\n *\\d+ files? changed.*$/, ""));
+    html += '</div>';
+  }
+
+  // Diff lines with syntax highlighting
+  if (data.diff) {
+    html += '<pre class="diff-pre">';
+    const lines = data.diff.split("\\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      let cls = "diff-line";
+      if (line.startsWith("+")) {
+        cls += line.startsWith("+++") ? " diff-line-file" : " diff-line-add";
+      } else if (line.startsWith("-")) {
+        cls += line.startsWith("---") ? " diff-line-file" : " diff-line-del";
+      } else if (line.startsWith("@@")) {
+        cls += " diff-line-hunk";
+      } else if (line.startsWith("diff --git")) {
+        cls += " diff-line-file";
+      }
+      html += '<span class="' + cls + '">' + escHtml(line) + '</span>';
+    }
+    html += '</pre>';
+  }
+  return html;
 }
 
 function toggleTimelineOrder(id) {
