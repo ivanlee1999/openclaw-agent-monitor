@@ -2599,6 +2599,58 @@ a:hover { text-decoration: underline; }
 .diff-line-hunk { color: var(--text-muted); background: rgba(137,180,250, 0.08); }
 .diff-line-file { font-weight: 700; }
 
+/* Diff view toggle & split view */
+.diff-actions { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.diff-actions-left { font-size: 12px; color: var(--text-muted); }
+.diff-actions-right { display: flex; align-items: center; gap: 8px; }
+.diff-split-toggle {
+  display: inline-flex; border: 1px solid var(--border); border-radius: 2px; overflow: hidden;
+}
+.diff-split-toggle button {
+  border: none; background: var(--surface); color: var(--text-secondary);
+  padding: 3px 10px; font-size: 11px; cursor: pointer; font-family: inherit;
+}
+.diff-split-toggle button.active {
+  background: var(--accent); color: var(--bg);
+}
+.diff-split-view { border: 1px solid var(--border); border-radius: 2px; overflow: hidden; margin-top: 0; }
+.diff-split-file-header {
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: 6px 14px; font-family: var(--mono); font-size: 12px; font-weight: 700;
+  color: var(--text-heading);
+}
+.diff-split-file-header + .diff-split-file-header { border-top: 1px solid var(--border); }
+.diff-split-grid { display: grid; grid-template-columns: 1fr 1fr; }
+.diff-split-pane {
+  max-height: 600px; overflow: auto; background: var(--surface);
+}
+.diff-split-pane-right { border-left: 1px solid var(--border); }
+.diff-split-row {
+  display: grid; grid-template-columns: 50px 1fr;
+  font-family: var(--mono); font-size: 12px; line-height: 1.6; min-height: 1.6em;
+}
+.diff-split-line-no {
+  color: var(--text-muted); padding: 0 8px; text-align: right; user-select: none;
+  border-right: 1px solid var(--border);
+}
+.diff-split-code { white-space: pre; padding: 0 14px 0 8px; }
+.diff-split-row-add { background: var(--diff-add-bg); }
+.diff-split-row-del { background: var(--diff-del-bg); }
+.diff-split-row-empty { background: rgba(137,180,250, 0.04); }
+.diff-split-hunk {
+  padding: 4px 14px; font-family: var(--mono); font-size: 12px;
+  color: var(--text-muted); background: rgba(137,180,250, 0.08);
+  min-height: 1.6em; line-height: 1.6;
+}
+.diff-split-meta {
+  padding: 2px 14px; font-family: var(--mono); font-size: 11px;
+  color: var(--text-muted); font-style: italic;
+}
+@media (max-width: 1200px) {
+  .diff-split-toggle { display: none; }
+  .diff-split-view { display: none; }
+}
+
 /* Tabs */
 .tab-bar {
   display: flex; gap: 0; margin-bottom: 16px; border-bottom: 1px solid var(--border);
@@ -4053,6 +4105,176 @@ let sessionRenderCache = {};
 let sessionsDataKey = "";
 let pipelinesDataKey = "";
 
+// Diff view mode (split/unified)
+const DIFF_VIEW_STORAGE_KEY = "diffViewMode";
+let preferredDiffView = (function() {
+  try {
+    const saved = localStorage.getItem(DIFF_VIEW_STORAGE_KEY);
+    if (saved === "unified" || saved === "split") return saved;
+  } catch(e) {}
+  return "split";
+})();
+const diffScrollSyncState = {};
+
+function canUseSplitDiff() { return window.innerWidth > 1200; }
+
+function getEffectiveDiffView() {
+  return canUseSplitDiff() ? preferredDiffView : "unified";
+}
+
+function setDiffView(mode) {
+  preferredDiffView = mode === "split" ? "split" : "unified";
+  try { localStorage.setItem(DIFF_VIEW_STORAGE_KEY, preferredDiffView); } catch(e) {}
+  sessionRenderCache = {};
+  renderSessions();
+  if (expandedStageId) renderPipelines();
+}
+
+function syncDiffScroll(key, side, sourceEl) {
+  if (diffScrollSyncState[key]) return;
+  var otherId = side === "left" ? "diff-right-" + key : "diff-left-" + key;
+  var otherEl = document.getElementById(otherId);
+  if (!otherEl) return;
+  diffScrollSyncState[key] = true;
+  otherEl.scrollTop = sourceEl.scrollTop;
+  otherEl.scrollLeft = sourceEl.scrollLeft;
+  requestAnimationFrame(function() { diffScrollSyncState[key] = false; });
+}
+
+function getDiffViewToggleHtml() {
+  var mode = getEffectiveDiffView();
+  return '<div class="diff-split-toggle">'
+    + '<button class="' + (mode === "unified" ? "active" : "") + '" onclick="setDiffView(\\'unified\\')">Unified</button>'
+    + '<button class="' + (mode === "split" ? "active" : "") + '" onclick="setDiffView(\\'split\\')">Split</button>'
+    + '</div>';
+}
+
+function parseUnifiedDiffForSplit(diffText) {
+  var files = [];
+  var currentFile = null;
+  var currentHunk = null;
+  var removed = [];
+  var added = [];
+  var oldNo = 0;
+  var newNo = 0;
+  var lines = diffText.split("\\n");
+
+  function emptyCell() { return { type: "empty", no: "", text: "" }; }
+
+  function flushChanges() {
+    if (!currentHunk) return;
+    var count = Math.max(removed.length, added.length);
+    for (var i = 0; i < count; i++) {
+      currentHunk.rows.push({
+        left: removed[i] || emptyCell(),
+        right: added[i] || emptyCell()
+      });
+    }
+    removed = [];
+    added = [];
+  }
+
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+
+    if (line.startsWith("diff --git ")) {
+      flushChanges();
+      currentFile = { header: line, oldFile: "", newFile: "", hunks: [] };
+      files.push(currentFile);
+      currentHunk = null;
+      continue;
+    }
+
+    if (!currentFile) continue;
+
+    if (line.startsWith("index ") || line.startsWith("new file mode") || line.startsWith("deleted file mode") || line.startsWith("old mode") || line.startsWith("new mode") || line.startsWith("similarity index") || line.startsWith("rename from") || line.startsWith("rename to") || line.startsWith("Binary files")) {
+      continue;
+    }
+
+    if (line.startsWith("--- ")) {
+      currentFile.oldFile = line;
+      continue;
+    }
+    if (line.startsWith("+++ ")) {
+      currentFile.newFile = line;
+      continue;
+    }
+
+    var hunkMatch = line.match(/^@@ -(\\d+)(?:,\\d+)? \\+(\\d+)(?:,\\d+)? @@(.*)/);
+    if (hunkMatch) {
+      flushChanges();
+      oldNo = parseInt(hunkMatch[1], 10);
+      newNo = parseInt(hunkMatch[2], 10);
+      currentHunk = { header: line, rows: [] };
+      if (currentFile) currentFile.hunks.push(currentHunk);
+      continue;
+    }
+
+    if (!currentHunk) continue;
+
+    if (line.startsWith("-")) {
+      removed.push({ type: "del", no: oldNo++, text: line.slice(1) });
+    } else if (line.startsWith("+")) {
+      added.push({ type: "add", no: newNo++, text: line.slice(1) });
+    } else if (line.startsWith("\\\\ ")) {
+      // "\\ No newline at end of file" — skip as metadata
+      continue;
+    } else {
+      flushChanges();
+      var text = line.length > 0 ? line.slice(1) : "";
+      currentHunk.rows.push({
+        left: { type: "context", no: oldNo++, text: text },
+        right: { type: "context", no: newNo++, text: text }
+      });
+    }
+  }
+  flushChanges();
+  return { files: files };
+}
+
+function renderSplitPane(file, side) {
+  var html = "";
+  for (var h = 0; h < file.hunks.length; h++) {
+    var hunk = file.hunks[h];
+    html += '<div class="diff-split-hunk">' + escHtml(hunk.header) + '</div>';
+    var rows = hunk.rows;
+    for (var r = 0; r < rows.length; r++) {
+      var cell = side === "left" ? rows[r].left : rows[r].right;
+      var cls = "diff-split-row";
+      if (cell.type === "add") cls += " diff-split-row-add";
+      else if (cell.type === "del") cls += " diff-split-row-del";
+      else if (cell.type === "empty") cls += " diff-split-row-empty";
+      html += '<div class="' + cls + '">'
+        + '<span class="diff-split-line-no">' + (cell.no !== "" ? cell.no : "") + '</span>'
+        + '<span class="diff-split-code">' + (cell.text !== "" ? escHtml(cell.text) : "\\u00a0") + '</span>'
+        + '</div>';
+    }
+  }
+  return html;
+}
+
+function getDiffSplitHtml(id) {
+  var data = diffCache[id];
+  var parsed = parseUnifiedDiffForSplit(data.diff || "");
+  var html = '<div class="diff-split-view">';
+  for (var f = 0; f < parsed.files.length; f++) {
+    var file = parsed.files[f];
+    var fileLabel = file.newFile ? file.newFile.replace(/^\\+\\+\\+ [ab]\\//, "") : file.header;
+    html += '<div class="diff-split-file-header">' + escHtml(fileLabel) + '</div>';
+    var key = id + "-" + f;
+    html += '<div class="diff-split-grid">';
+    html += '<div class="diff-split-pane diff-split-pane-left" id="diff-left-' + key + '" onscroll="syncDiffScroll(\\'' + key + '\\', \\'left\\', this)">';
+    html += renderSplitPane(file, "left");
+    html += '</div>';
+    html += '<div class="diff-split-pane diff-split-pane-right" id="diff-right-' + key + '" onscroll="syncDiffScroll(\\'' + key + '\\', \\'right\\', this)">';
+    html += renderSplitPane(file, "right");
+    html += '</div>';
+    html += '</div>';
+  }
+  html += '</div>';
+  return html;
+}
+
 // Debounce search
 let searchTimeout = null;
 document.getElementById("search-input").addEventListener("input", (e) => {
@@ -4805,15 +5027,42 @@ function ensureDiffLoaded(id) {
     });
 }
 
+function getUnifiedDiffBodyHtml(data) {
+  if (!data.diff) return "";
+  var html = '<pre class="diff-pre">';
+  var lines = data.diff.split("\\n");
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    var cls = "diff-line";
+    if (line.startsWith("+")) {
+      cls += line.startsWith("+++") ? " diff-line-file" : " diff-line-add";
+    } else if (line.startsWith("-")) {
+      cls += line.startsWith("---") ? " diff-line-file" : " diff-line-del";
+    } else if (line.startsWith("@@")) {
+      cls += " diff-line-hunk";
+    } else if (line.startsWith("diff --git")) {
+      cls += " diff-line-file";
+    }
+    html += '<span class="' + cls + '">' + escHtml(line) + '</span>';
+  }
+  html += '</pre>';
+  return html;
+}
+
 function getDiffHtml(id) {
   const data = diffCache[id];
   if (data === undefined) return '<p class="output-loading">Loading diff...</p>';
   if (!data || !data.available) {
     return '<p class="output-error">' + escHtml((data && data.reason) || "No code changes detected") + '</p>';
   }
-  let html = '<div class="output-actions">'
-    + '<span style="font-size:12px;color:var(--text-muted)">Code changes</span>'
-    + '<button onclick="copyDiff(\\'' + id + '\\')">&#x1f4cb; Copy diff</button></div>';
+
+  // Header with toggle
+  let html = '<div class="diff-actions">'
+    + '<div class="diff-actions-left">Code changes</div>'
+    + '<div class="diff-actions-right">'
+    + getDiffViewToggleHtml()
+    + '<button onclick="copyDiff(\\'' + id + '\\')">&#x1f4cb; Copy diff</button>'
+    + '</div></div>';
 
   // Commit info
   if (data.commit) {
@@ -4832,26 +5081,13 @@ function getDiffHtml(id) {
     html += '</div>';
   }
 
-  // Diff lines with syntax highlighting
-  if (data.diff) {
-    html += '<pre class="diff-pre">';
-    const lines = data.diff.split("\\n");
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      let cls = "diff-line";
-      if (line.startsWith("+")) {
-        cls += line.startsWith("+++") ? " diff-line-file" : " diff-line-add";
-      } else if (line.startsWith("-")) {
-        cls += line.startsWith("---") ? " diff-line-file" : " diff-line-del";
-      } else if (line.startsWith("@@")) {
-        cls += " diff-line-hunk";
-      } else if (line.startsWith("diff --git")) {
-        cls += " diff-line-file";
-      }
-      html += '<span class="' + cls + '">' + escHtml(line) + '</span>';
-    }
-    html += '</pre>';
+  // Render diff body based on effective view mode
+  if (getEffectiveDiffView() === "split" && data.diff) {
+    html += getDiffSplitHtml(id);
+  } else {
+    html += getUnifiedDiffBodyHtml(data);
   }
+
   return html;
 }
 
