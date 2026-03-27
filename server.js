@@ -2650,6 +2650,70 @@ a:hover { text-decoration: underline; }
   .diff-split-toggle { display: none; }
 }
 
+/* Diff sidebar */
+.diff-layout {
+  display: flex; gap: 0; position: relative;
+}
+.diff-layout.is-collapsed .diff-sidebar {
+  width: 0; min-width: 0; overflow: hidden; opacity: 0; pointer-events: none;
+  border-right: none; padding: 0; transition: width 0.2s, opacity 0.15s;
+}
+.diff-sidebar {
+  width: 250px; min-width: 250px; max-width: 250px;
+  border-right: 1px solid var(--border);
+  background: var(--bg-card);
+  position: sticky; top: 0; align-self: flex-start;
+  max-height: calc(100vh - 120px); overflow-y: auto;
+  border-radius: 8px 0 0 8px;
+  flex-shrink: 0;
+  transition: width 0.2s, opacity 0.15s;
+}
+.diff-sidebar-header {
+  padding: 10px 12px; font-size: 12px; font-weight: 600;
+  color: var(--text-secondary); border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; background: var(--bg-card); z-index: 1;
+}
+.diff-sidebar-title { text-transform: uppercase; letter-spacing: 0.03em; }
+.diff-sidebar-list { padding: 4px 0; }
+.diff-file-item {
+  display: flex; align-items: center; gap: 6px;
+  width: 100%; padding: 5px 12px; border: none; background: transparent;
+  color: var(--text-secondary); font-size: 12px; font-family: var(--mono);
+  cursor: pointer; text-align: left; line-height: 1.4;
+  transition: background 0.1s, color 0.1s;
+}
+.diff-file-item:hover { background: rgba(137,180,250, 0.08); color: var(--text-heading); }
+.diff-file-item.active { background: rgba(137,180,250, 0.14); color: var(--accent); }
+.diff-file-icon { flex-shrink: 0; font-size: 13px; }
+.diff-file-name {
+  flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.diff-file-badges { display: flex; gap: 4px; flex-shrink: 0; }
+.diff-file-badge {
+  font-size: 10px; font-weight: 600; padding: 1px 4px;
+  border-radius: 4px; font-family: var(--mono);
+}
+.diff-file-badge-add { color: #a6e3a1; background: rgba(166,227,161,0.12); }
+.diff-file-badge-del { color: #f38ba8; background: rgba(243,139,168,0.12); }
+.diff-main { flex: 1; min-width: 0; overflow: hidden; }
+.diff-sidebar-toggle {
+  background: transparent; border: 1px solid var(--border); border-radius: 4px;
+  color: var(--text-secondary); padding: 3px 8px; cursor: pointer;
+  font-size: 12px; font-family: 'Inter', system-ui, sans-serif;
+  transition: all 0.15s; margin-right: 8px;
+}
+.diff-sidebar-toggle:hover { color: var(--text-heading); border-color: var(--text-muted); }
+.diff-file-section { scroll-margin-top: 80px; }
+.diff-unified-file-header {
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: 6px 14px; font-family: var(--mono); font-size: 12px; font-weight: 700;
+  color: var(--text-heading);
+}
+@media (max-width: 1200px) {
+  .diff-sidebar { display: none; }
+  .diff-sidebar-toggle { display: none; }
+}
+
 /* Tabs */
 .tab-bar {
   display: flex; gap: 0; margin-bottom: 16px; border-bottom: 1px solid var(--border);
@@ -4095,6 +4159,12 @@ let expandedStageId = null;
 let outputCache = {};
 let historyCache = {};
 let diffCache = {};
+function getParsedDiff(id) {
+  var data = diffCache[id];
+  if (!data || !data.diff) return { files: [] };
+  if (!data._parsedDiff) data._parsedDiff = parseUnifiedDiffForSplit(data.diff);
+  return data._parsedDiff;
+}
 let diffFetchInFlight = {};
 let activeTab = {};
 let previewCache = {};
@@ -4114,6 +4184,86 @@ let preferredDiffView = (function() {
   return "split";
 })();
 const diffScrollSyncState = {};
+
+// Diff sidebar state
+const DIFF_SIDEBAR_STORAGE_KEY = "diffSidebarCollapsed";
+let diffSidebarCollapsed = (function() {
+  try {
+    const saved = localStorage.getItem(DIFF_SIDEBAR_STORAGE_KEY);
+    if (saved === "true" || saved === "false") return saved === "true";
+  } catch(e) {}
+  return false;
+})();
+const diffActiveFileBySession = {};
+
+function toggleDiffSidebar() {
+  diffSidebarCollapsed = !diffSidebarCollapsed;
+  try { localStorage.setItem(DIFF_SIDEBAR_STORAGE_KEY, diffSidebarCollapsed ? "true" : "false"); } catch(e) {}
+  sessionRenderCache = {};
+  renderSessions();
+  if (expandedStageId) renderPipelines();
+}
+
+function scrollToDiffFile(id, anchorId) {
+  var el = document.getElementById(anchorId);
+  if (!el) return;
+  el.scrollIntoView({ behavior: "smooth", block: "start" });
+  setActiveDiffFile(id, anchorId);
+}
+
+function setActiveDiffFile(id, anchorId) {
+  diffActiveFileBySession[id] = anchorId;
+  var layout = document.querySelector('.diff-layout[data-diff-id="' + id + '"]');
+  if (!layout) return;
+  var items = layout.querySelectorAll('.diff-file-item');
+  for (var i = 0; i < items.length; i++) {
+    if (items[i].getAttribute('data-file-anchor') === anchorId) {
+      items[i].classList.add('active');
+      items[i].scrollIntoView({ behavior: "smooth", block: "nearest" });
+    } else {
+      items[i].classList.remove('active');
+    }
+  }
+}
+
+function setupDiffSidebarObserver(id) {
+  teardownDiffSidebarObserver(id);
+  var layout = document.querySelector('.diff-layout[data-diff-id="' + id + '"]');
+  if (!layout) return;
+  var sections = layout.querySelectorAll('.diff-file-section');
+  if (sections.length === 0) return;
+
+  var observer = new IntersectionObserver(function(entries) {
+    var bestEntry = null;
+    var bestRatio = 0;
+    for (var i = 0; i < entries.length; i++) {
+      if (entries[i].isIntersecting && entries[i].intersectionRatio > bestRatio) {
+        bestRatio = entries[i].intersectionRatio;
+        bestEntry = entries[i];
+      }
+    }
+    if (bestEntry) {
+      setActiveDiffFile(id, bestEntry.target.id);
+    }
+  }, {
+    threshold: [0, 0.25, 0.5],
+    rootMargin: "-80px 0px -60% 0px"
+  });
+
+  for (var i = 0; i < sections.length; i++) {
+    observer.observe(sections[i]);
+  }
+
+  if (!window._diffSidebarObservers) window._diffSidebarObservers = {};
+  window._diffSidebarObservers[id] = observer;
+}
+
+function teardownDiffSidebarObserver(id) {
+  if (window._diffSidebarObservers && window._diffSidebarObservers[id]) {
+    window._diffSidebarObservers[id].disconnect();
+    delete window._diffSidebarObservers[id];
+  }
+}
 
 function canUseSplitDiff() { return window.innerWidth > 1200; }
 
@@ -4160,6 +4310,41 @@ function getDiffViewToggleHtml() {
     + '<button class="' + (mode === "unified" ? "active" : "") + '" onclick="setDiffView(\\'unified\\')">Unified</button>'
     + '<button class="' + (mode === "split" ? "active" : "") + '" onclick="setDiffView(\\'split\\')">Split</button>'
     + '</div>';
+}
+
+function getDiffFileDisplayPath(file) {
+  for (var i = 0; i < file.meta.length; i++) {
+    if (file.meta[i].startsWith("rename to ")) return file.meta[i].slice(10);
+  }
+  if (file.newFile && file.newFile.indexOf("/dev/null") === -1) {
+    return file.newFile.replace(/^\\+\\+\\+ [ab]\\//, "");
+  }
+  if (file.oldFile && file.oldFile.indexOf("/dev/null") === -1) {
+    return file.oldFile.replace(/^--- [ab]\\//, "");
+  }
+  var m = file.header.match(/diff --git a\\/(.*) b\\/(.*)/);
+  return m ? m[2] : file.header;
+}
+
+function getDiffFileBasename(filePath) {
+  var idx = filePath.lastIndexOf("/");
+  return idx >= 0 ? filePath.slice(idx + 1) : filePath;
+}
+
+function getDiffFileIcon(filePath) {
+  var ext = filePath.lastIndexOf(".") >= 0 ? filePath.slice(filePath.lastIndexOf(".")).toLowerCase() : "";
+  if (ext === ".js" || ext === ".ts" || ext === ".jsx" || ext === ".tsx" || ext === ".mjs" || ext === ".cjs") return "\\u{1F7E8}";
+  if (ext === ".py" || ext === ".pyw") return "\\u{1F40D}";
+  if (ext === ".md" || ext === ".txt" || ext === ".rst") return "\\u{1F4DD}";
+  if (ext === ".json" || ext === ".yaml" || ext === ".yml" || ext === ".toml" || ext === ".ini" || ext === ".cfg") return "\\u2699\\uFE0F";
+  if (ext === ".css" || ext === ".scss" || ext === ".less" || ext === ".sass") return "\\u{1F3A8}";
+  if (ext === ".html" || ext === ".htm" || ext === ".vue" || ext === ".svelte") return "\\u{1F310}";
+  if (ext === ".go") return "\\u{1F439}";
+  if (ext === ".rs") return "\\u{1F980}";
+  if (ext === ".java" || ext === ".kt") return "\\u2615";
+  if (ext === ".rb") return "\\u{1F48E}";
+  if (ext === ".sh" || ext === ".bash" || ext === ".zsh") return "\\u{1F4DF}";
+  return "\\u{1F4C4}";
 }
 
 function parseUnifiedDiffForSplit(diffText) {
@@ -4243,7 +4428,44 @@ function parseUnifiedDiffForSplit(diffText) {
     }
   }
   flushChanges();
+  for (var fi = 0; fi < files.length; fi++) {
+    var f = files[fi];
+    f.additions = 0;
+    f.deletions = 0;
+    for (var hi = 0; hi < f.hunks.length; hi++) {
+      var rows = f.hunks[hi].rows;
+      for (var ri = 0; ri < rows.length; ri++) {
+        if (rows[ri].left && rows[ri].left.type === "del") f.deletions++;
+        if (rows[ri].right && rows[ri].right.type === "add") f.additions++;
+      }
+    }
+    f.displayPath = getDiffFileDisplayPath(f);
+    f.basename = getDiffFileBasename(f.displayPath);
+    f.icon = getDiffFileIcon(f.displayPath);
+    f.anchorId = "diff-file-" + fi + "-" + f.displayPath.replace(/[^a-zA-Z0-9]/g, "-");
+    f.key = f.anchorId;
+  }
   return { files: files };
+}
+
+function getDiffSidebarHtml(id, files) {
+  var html = '<aside class="diff-sidebar">';
+  html += '<div class="diff-sidebar-header"><span class="diff-sidebar-title">' + files.length + ' file' + (files.length !== 1 ? 's' : '') + ' changed</span></div>';
+  html += '<div class="diff-sidebar-list">';
+  for (var i = 0; i < files.length; i++) {
+    var f = files[i];
+    var isActive = diffActiveFileBySession[id] === f.anchorId;
+    html += '<button class="diff-file-item' + (isActive ? ' active' : '') + '" data-file-anchor="' + escHtml(f.anchorId) + '" onclick="scrollToDiffFile(\'' + escHtml(id) + '\', \'' + escHtml(f.anchorId) + '\')" title="' + escHtml(f.displayPath) + '">';
+    html += '<span class="diff-file-icon">' + f.icon + '</span>';
+    html += '<span class="diff-file-name">' + escHtml(f.basename) + '</span>';
+    html += '<span class="diff-file-badges">';
+    if (f.additions > 0) html += '<span class="diff-file-badge diff-file-badge-add">+' + f.additions + '</span>';
+    if (f.deletions > 0) html += '<span class="diff-file-badge diff-file-badge-del">\u2212' + f.deletions + '</span>';
+    html += '</span>';
+    html += '</button>';
+  }
+  html += '</div></aside>';
+  return html;
 }
 
 function renderSplitPane(file, side) {
@@ -4273,13 +4495,14 @@ function getDiffSplitHtml(id) {
 
   // If no files were parsed at all, fall back to unified rendering
   if (parsed.files.length === 0) {
-    return getUnifiedDiffBodyHtml(data);
+    return { html: getUnifiedDiffBodyHtml(data), files: [] };
   }
 
   var html = '<div class="diff-split-view">';
   for (var f = 0; f < parsed.files.length; f++) {
     var file = parsed.files[f];
     var fileLabel = file.newFile ? file.newFile.replace(/^\\+\\+\\+ [ab]\\//, "") : file.header;
+    html += '<section class="diff-file-section" id="' + escHtml(file.anchorId) + '">';
     html += '<div class="diff-split-file-header">' + escHtml(fileLabel) + '</div>';
 
     // If file has no hunks but has metadata (binary, rename, mode-only), render metadata
@@ -4289,6 +4512,7 @@ function getDiffSplitHtml(id) {
         html += escHtml(file.meta[m]) + '<br>';
       }
       html += '</div>';
+      html += '</section>';
       continue;
     }
 
@@ -4301,9 +4525,10 @@ function getDiffSplitHtml(id) {
     html += renderSplitPane(file, "right");
     html += '</div>';
     html += '</div>';
+    html += '</section>';
   }
   html += '</div>';
-  return html;
+  return { html: html, files: parsed.files };
 }
 
 // Debounce search
@@ -4782,6 +5007,28 @@ function renderSessions() {
   }
 
   sessionRenderCache = nextCache;
+
+  // Wire up diff sidebar observers for visible diff layouts
+  requestAnimationFrame(function() {
+    var layouts = document.querySelectorAll('.diff-layout[data-diff-id]');
+    var activeIds = {};
+    for (var i = 0; i < layouts.length; i++) {
+      var did = layouts[i].getAttribute('data-diff-id');
+      activeIds[did] = true;
+      setupDiffSidebarObserver(did);
+      // Restore active file or default to first
+      if (!diffActiveFileBySession[did]) {
+        var first = layouts[i].querySelector('.diff-file-section');
+        if (first) setActiveDiffFile(did, first.id);
+      }
+    }
+    // Teardown observers for removed layouts
+    if (window._diffSidebarObservers) {
+      for (var oid in window._diffSidebarObservers) {
+        if (!activeIds[oid]) teardownDiffSidebarObserver(oid);
+      }
+    }
+  });
 }
 
 
@@ -5060,6 +5307,46 @@ function ensureDiffLoaded(id) {
 
 function getUnifiedDiffBodyHtml(data) {
   if (!data.diff) return "";
+  var parsed = parseUnifiedDiffForSplit(data.diff);
+
+  // If parser found files, render per-file sections
+  if (parsed.files.length > 0) {
+    var html = "";
+    for (var fi = 0; fi < parsed.files.length; fi++) {
+      var file = parsed.files[fi];
+      html += '<section class="diff-file-section" id="' + escHtml(file.anchorId) + '">';
+      html += '<div class="diff-unified-file-header">' + escHtml(file.displayPath) + '</div>';
+      html += '<pre class="diff-pre">';
+      // Render meta lines
+      for (var mi = 0; mi < file.meta.length; mi++) {
+        html += '<span class="diff-line">' + escHtml(file.meta[mi]) + '</span>';
+      }
+      // Render hunks as unified lines
+      for (var hi = 0; hi < file.hunks.length; hi++) {
+        var hunk = file.hunks[hi];
+        html += '<span class="diff-line diff-line-hunk">' + escHtml(hunk.header) + '</span>';
+        var rows = hunk.rows;
+        for (var ri = 0; ri < rows.length; ri++) {
+          var row = rows[ri];
+          // Deletions first, then additions, then context
+          if (row.left && row.left.type === "del") {
+            html += '<span class="diff-line diff-line-del">-' + escHtml(row.left.text) + '</span>';
+          }
+          if (row.right && row.right.type === "add") {
+            html += '<span class="diff-line diff-line-add">+' + escHtml(row.right.text) + '</span>';
+          }
+          if (row.left && row.left.type === "context") {
+            html += '<span class="diff-line"> ' + escHtml(row.left.text) + '</span>';
+          }
+        }
+      }
+      html += '</pre>';
+      html += '</section>';
+    }
+    return { html: html, files: parsed.files };
+  }
+
+  // Fallback: render raw lines (no parseable file structure)
   var html = '<pre class="diff-pre">';
   var lines = data.diff.split("\\n");
   for (var i = 0; i < lines.length; i++) {
@@ -5077,7 +5364,7 @@ function getUnifiedDiffBodyHtml(data) {
     html += '<span class="' + cls + '">' + escHtml(line) + '</span>';
   }
   html += '</pre>';
-  return html;
+  return { html: html, files: [] };
 }
 
 function getDiffHtml(id) {
@@ -5091,6 +5378,9 @@ function getDiffHtml(id) {
   let html = '<div class="diff-actions">'
     + '<div class="diff-actions-left">Code changes</div>'
     + '<div class="diff-actions-right">'
+    + '<button class="diff-sidebar-toggle" onclick="toggleDiffSidebar()">'
+    + (diffSidebarCollapsed ? '&#x25b6; Files' : '&#x25c0; Files')
+    + '</button>'
     + getDiffViewToggleHtml()
     + '<button onclick="copyDiff(\\'' + id + '\\')">&#x1f4cb; Copy diff</button>'
     + '</div></div>';
@@ -5113,11 +5403,23 @@ function getDiffHtml(id) {
   }
 
   // Render diff body based on effective view mode
+  var diffResult;
   if (getEffectiveDiffView() === "split" && data.diff) {
-    html += getDiffSplitHtml(id);
+    diffResult = getDiffSplitHtml(id);
   } else {
-    html += getUnifiedDiffBodyHtml(data);
+    diffResult = getUnifiedDiffBodyHtml(data);
   }
+
+  var bodyHtml = typeof diffResult === "object" ? diffResult.html : diffResult;
+  var files = typeof diffResult === "object" ? diffResult.files : [];
+
+  // Wrap in sidebar layout
+  html += '<div class="diff-layout' + (diffSidebarCollapsed ? ' is-collapsed' : '') + '" data-diff-id="' + escHtml(id) + '">';
+  if (!diffSidebarCollapsed && files.length > 0) {
+    html += getDiffSidebarHtml(id, files);
+  }
+  html += '<div class="diff-main">' + bodyHtml + '</div>';
+  html += '</div>';
 
   return html;
 }
@@ -6180,6 +6482,7 @@ document.addEventListener("DOMContentLoaded", function() {
 </html>`;
 
 app.get("/", (_req, res) => {
+  res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   res.type("html").send(HTML);
 });
 
