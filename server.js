@@ -4205,7 +4205,9 @@ function toggleDiffSidebar() {
 }
 
 function scrollToDiffFile(id, anchorId) {
-  var el = document.getElementById(anchorId);
+  var layout = document.querySelector('.diff-layout[data-diff-id="' + id + '"]');
+  if (!layout) return;
+  var el = layout.querySelector('#' + CSS.escape(anchorId));
   if (!el) return;
   el.scrollIntoView({ behavior: "smooth", block: "start" });
   setActiveDiffFile(id, anchorId);
@@ -4345,6 +4347,15 @@ function getDiffFileIcon(filePath) {
   if (ext === ".rb") return "\\u{1F48E}";
   if (ext === ".sh" || ext === ".bash" || ext === ".zsh") return "\\u{1F4DF}";
   return "\\u{1F4C4}";
+}
+
+function scopeParsedDiffFiles(parsed, id) {
+  for (var i = 0; i < parsed.files.length; i++) {
+    var f = parsed.files[i];
+    f.anchorId = "diff-" + id.replace(/[^a-zA-Z0-9]/g, "-") + "-file-" + i + "-" + f.displayPath.replace(/[^a-zA-Z0-9]/g, "-");
+    f.key = f.anchorId;
+  }
+  return parsed;
 }
 
 function parseUnifiedDiffForSplit(diffText) {
@@ -4491,11 +4502,11 @@ function renderSplitPane(file, side) {
 
 function getDiffSplitHtml(id) {
   var data = diffCache[id];
-  var parsed = parseUnifiedDiffForSplit(data.diff || "");
+  var parsed = scopeParsedDiffFiles(parseUnifiedDiffForSplit(data.diff || ""), id);
 
   // If no files were parsed at all, fall back to unified rendering
   if (parsed.files.length === 0) {
-    return getUnifiedDiffBodyHtml(data);
+    return getUnifiedDiffBodyHtml(data, id);
   }
 
   var html = '<div class="diff-split-view">';
@@ -5310,50 +5321,64 @@ function ensureDiffLoaded(id) {
     });
 }
 
-function getUnifiedDiffBodyHtml(data) {
+function getUnifiedDiffBodyHtml(data, id) {
   if (!data.diff) return "";
-  var parsed = parseUnifiedDiffForSplit(data.diff);
 
-  // If parser found files, render per-file sections
+  // Parse to get file metadata for sidebar navigation
+  var parsed = id ? scopeParsedDiffFiles(parseUnifiedDiffForSplit(data.diff), id) : parseUnifiedDiffForSplit(data.diff);
+
+  // Render the original diff text verbatim, wrapping each file in a section
+  // for sidebar navigation when files are detected
+  var lines = data.diff.split("\\n");
+
   if (parsed.files.length > 0) {
     var html = "";
-    for (var fi = 0; fi < parsed.files.length; fi++) {
-      var file = parsed.files[fi];
-      html += '<section class="diff-file-section" id="' + escHtml(file.anchorId) + '">';
-      html += '<div class="diff-unified-file-header">' + escHtml(file.displayPath) + '</div>';
-      html += '<pre class="diff-pre">';
-      // Render meta lines
-      for (var mi = 0; mi < file.meta.length; mi++) {
-        html += '<span class="diff-line">' + escHtml(file.meta[mi]) + '</span>';
-      }
-      // Render hunks as unified lines
-      for (var hi = 0; hi < file.hunks.length; hi++) {
-        var hunk = file.hunks[hi];
-        html += '<span class="diff-line diff-line-hunk">' + escHtml(hunk.header) + '</span>';
-        var rows = hunk.rows;
-        for (var ri = 0; ri < rows.length; ri++) {
-          var row = rows[ri];
-          // Deletions first, then additions, then context
-          if (row.left && row.left.type === "del") {
-            html += '<span class="diff-line diff-line-del">-' + escHtml(row.left.text) + '</span>';
-          }
-          if (row.right && row.right.type === "add") {
-            html += '<span class="diff-line diff-line-add">+' + escHtml(row.right.text) + '</span>';
-          }
-          if (row.left && row.left.type === "context") {
-            html += '<span class="diff-line"> ' + escHtml(row.left.text) + '</span>';
-          }
+    var fileIdx = 0;
+    var inFile = false;
+
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+
+      // Detect file boundaries
+      if (line.startsWith("diff --git ")) {
+        // Close previous file section
+        if (inFile) {
+          html += '</pre></section>';
+        }
+        // Open new file section
+        if (fileIdx < parsed.files.length) {
+          var file = parsed.files[fileIdx];
+          html += '<section class="diff-file-section" id="' + escHtml(file.anchorId) + '">';
+          html += '<div class="diff-unified-file-header">' + escHtml(file.displayPath) + '</div>';
+          html += '<pre class="diff-pre">';
+          fileIdx++;
+          inFile = true;
         }
       }
-      html += '</pre>';
-      html += '</section>';
+
+      // Classify the line for styling
+      var cls = "diff-line";
+      if (line.startsWith("+")) {
+        cls += line.startsWith("+++") ? " diff-line-file" : " diff-line-add";
+      } else if (line.startsWith("-")) {
+        cls += line.startsWith("---") ? " diff-line-file" : " diff-line-del";
+      } else if (line.startsWith("@@")) {
+        cls += " diff-line-hunk";
+      } else if (line.startsWith("diff --git")) {
+        cls += " diff-line-file";
+      } else if (line.startsWith("\\\\ ")) {
+        cls += " diff-line-meta";
+      }
+      html += '<span class="' + cls + '">' + escHtml(line) + '</span>';
+    }
+    if (inFile) {
+      html += '</pre></section>';
     }
     return { html: html, files: parsed.files };
   }
 
   // Fallback: render raw lines (no parseable file structure)
   var html = '<pre class="diff-pre">';
-  var lines = data.diff.split("\\n");
   for (var i = 0; i < lines.length; i++) {
     var line = lines[i];
     var cls = "diff-line";
@@ -5412,7 +5437,7 @@ function getDiffHtml(id) {
   if (getEffectiveDiffView() === "split" && data.diff) {
     diffResult = getDiffSplitHtml(id);
   } else {
-    diffResult = getUnifiedDiffBodyHtml(data);
+    diffResult = getUnifiedDiffBodyHtml(data, id);
   }
 
   var bodyHtml = typeof diffResult === "object" ? diffResult.html : diffResult;
