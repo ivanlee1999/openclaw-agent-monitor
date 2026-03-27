@@ -4495,7 +4495,7 @@ function getDiffSplitHtml(id) {
 
   // If no files were parsed at all, fall back to unified rendering
   if (parsed.files.length === 0) {
-    return { html: getUnifiedDiffBodyHtml(data), files: [] };
+    return getUnifiedDiffBodyHtml(data);
   }
 
   var html = '<div class="diff-split-view">';
@@ -4838,6 +4838,8 @@ function renderPipelines() {
   }
 
   list.innerHTML = filtered.map(p => renderPipelineCard(p)).join("");
+
+  wireDiffSidebarObservers();
 }
 
 function togglePipeline(pipelineName) {
@@ -4938,6 +4940,29 @@ function invalidateSessionCard(id) {
   delete sessionRenderCache[id];
 }
 
+function wireDiffSidebarObservers() {
+  requestAnimationFrame(function() {
+    var layouts = document.querySelectorAll('.diff-layout[data-diff-id]');
+    var activeIds = {};
+    for (var i = 0; i < layouts.length; i++) {
+      var did = layouts[i].getAttribute('data-diff-id');
+      activeIds[did] = true;
+      setupDiffSidebarObserver(did);
+      // Restore active file or default to first
+      if (!diffActiveFileBySession[did]) {
+        var first = layouts[i].querySelector('.diff-file-section');
+        if (first) setActiveDiffFile(did, first.id);
+      }
+    }
+    // Teardown observers for removed layouts
+    if (window._diffSidebarObservers) {
+      for (var oid in window._diffSidebarObservers) {
+        if (!activeIds[oid]) teardownDiffSidebarObserver(oid);
+      }
+    }
+  });
+}
+
 function renderSessions() {
   const list = document.getElementById("sessions-list");
   const filtered = getFilteredSessions();
@@ -5008,27 +5033,7 @@ function renderSessions() {
 
   sessionRenderCache = nextCache;
 
-  // Wire up diff sidebar observers for visible diff layouts
-  requestAnimationFrame(function() {
-    var layouts = document.querySelectorAll('.diff-layout[data-diff-id]');
-    var activeIds = {};
-    for (var i = 0; i < layouts.length; i++) {
-      var did = layouts[i].getAttribute('data-diff-id');
-      activeIds[did] = true;
-      setupDiffSidebarObserver(did);
-      // Restore active file or default to first
-      if (!diffActiveFileBySession[did]) {
-        var first = layouts[i].querySelector('.diff-file-section');
-        if (first) setActiveDiffFile(did, first.id);
-      }
-    }
-    // Teardown observers for removed layouts
-    if (window._diffSidebarObservers) {
-      for (var oid in window._diffSidebarObservers) {
-        if (!activeIds[oid]) teardownDiffSidebarObserver(oid);
-      }
-    }
-  });
+  wireDiffSidebarObservers();
 }
 
 
